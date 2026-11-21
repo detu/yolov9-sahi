@@ -125,10 +125,7 @@ fragment from its neighbour, or as two halves. As in the SAHI library, the defau
 is greedy NMM with the IOS metric: boxes of the same class whose intersection covers more
 than half of the smaller box are merged into their union, keeping the best score. Use
 `--merge nms --match iou` for plain NMS. SAHI works best when objects are smaller than a
-tile; add `--full` when the images also contain objects much larger than a tile. All workers share
-one copy of the model (ncnn runs several extractors on one network concurrently), and
-the next image is decoded in the background while the current one is processed. Output
-is deterministic regardless of the number of workers.
+tile; add `--full` when the images also contain objects much larger than a tile.
 
 ### Threading
 
