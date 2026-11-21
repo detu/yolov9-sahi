@@ -35,16 +35,21 @@ yolo export model=yolov9c.pt format=ncnn imgsz=640     # or your own trained bes
 mv yolov9c_ncnn_model models/
 ```
 
-This writes `model.ncnn.param`, `model.ncnn.bin` and `metadata.yaml`. Pass the folder to
-the program: the class names and input size are read from `metadata.yaml`.
+This writes `model.ncnn.param`, `model.ncnn.bin` and `metadata.yaml`. Pass the two model
+files; the class names and input size are read from the `metadata.yaml` next to the
+`.param` file:
+
+```bash
+./build/yolov9_sahi models/yolov9c_ncnn_model/model.ncnn.param models/yolov9c_ncnn_model/model.ncnn.bin images/
+```
 
 Models converted another way work too, e.g. the YOLOv9-C model from
 [twlelev/Yolov9-Ncnn](https://github.com/twlelev/Yolov9-Ncnn) (ONNX → ncnn, blobs
 `images` → `output0`; names come from `--names`, and the blob names are picked up
 automatically). The requirement is the usual
 `(4 + classes) × anchors` tensor (box centre x/y, width, height in input pixels, then the
-sigmoid class scores). Pass the `.param` file, and `--in`/`--out` if the blob names aren't
-the first input/output.
+sigmoid class scores). Pass `--in`/`--out` if the blob names aren't the first
+input/output.
 
 ## Build
 
@@ -69,26 +74,23 @@ there, or build natively on Windows/Linux for `--gpu`.
 
 ## Run
 
-The model is a `.param` + `.bin` pair. Pass the `.param` file (the `.bin` with the same
-name next to it is used), both files, or an Ultralytics export folder:
+Arguments are, in order: the model's `.param` file, its `.bin` file, then one or more
+images and/or directories:
 
-```bash
-./build/yolov9_sahi models/yolov9.param image.jpg                       # uses models/yolov9.bin
-./build/yolov9_sahi models/yolov9.param models/weights.bin image.jpg    # .bin named differently
-./build/yolov9_sahi models/yolov9c_ncnn_model image.jpg                 # Ultralytics export folder
+```
+yolov9_sahi <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]
 ```
 
 ```bash
 # one image
-./build/yolov9_sahi models/yolov9c_ncnn_model image.jpg -o result.jpg
+./build/yolov9_sahi models/yolov9.param models/yolov9.bin image.jpg -o result.jpg
 
 # a whole folder (add -r for subfolders), with a CSV of all detections
-./build/yolov9_sahi models/yolov9c_ncnn_model images/ -o results/ --csv detections.csv
+./build/yolov9_sahi models/yolov9.param models/yolov9.bin images/ -o results/ --csv detections.csv
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-b, --bin` | `.param` name with `.bin` | model weights, if not named like the `.param` (or give it as the 2nd argument) |
 | `-o, --output` | `sahi_output.jpg` / `sahi_output/` | output file for one image, output directory for several (`<name>_sahi.<ext>`) |
 | `--csv` | off | write all detections: `image,class_id,class_name,score,x1,y1,x2,y2` |
 | `-n, --names` | `metadata.yaml` | text file of class names, one per line: line 1 = class 0, line 2 = class 1, ... |
