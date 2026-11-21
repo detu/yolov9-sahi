@@ -58,31 +58,85 @@ picked up automatically). `--box`, `--pad`, `--in` and `--out` override the dete
 ## Build
 
 Requires CMake ≥ 3.18, a C++17 compiler with OpenMP, and OpenCV (core, imgproc,
-imgcodecs, dnn). ncnn is built from the submodule; the build type defaults to Release.
+imgcodecs, dnn). The build type defaults to Release. Pick the inference backend with
+`SAHI_BACKEND`:
+
+| `SAHI_BACKEND` | Engine | Model | Runs on |
+|---|---|---|---|
+| `ORT_CUDA` (default on this branch) | ONNX Runtime, CUDA execution provider | `.onnx` | NVIDIA GPU |
+| `ORT_CPU` | ONNX Runtime | `.onnx` | CPU |
+| `NCNN` | ncnn (submodule) | `.param` + `.bin` | CPU (or Vulkan) |
+
+### CUDA backend (ONNX Runtime + nvcc)
+
+ncnn has no CUDA backend, so the GPU path uses ONNX Runtime's CUDA execution provider.
+The image is copied to the GPU once; CUDA kernels compiled with nvcc cut the tiles out
+and write the network input directly (BGR→RGB, 0–1, planar), a batch of tiles at a time,
+and after inference pick the best class per anchor and keep only the candidates above
+the threshold, so just those few boxes come back to the CPU (instead of ~2.7 MB of raw
+output per tile). The network input and output stay in GPU memory (ONNX Runtime
+IoBinding).
+
+1. **CUDA toolkit** (nvcc) and **cuDNN 9** for your CUDA major version. In WSL2 install
+   only the toolkit (`cuda-toolkit` from NVIDIA's `wsl-ubuntu` repo) and cuDNN, never a
+   Linux GPU driver. With NVIDIA's apt repo: `sudo apt install libcudnn9-cuda-13`
+   (or `-cuda-12`).
+2. **ONNX Runtime GPU package**: download the Linux x64 GPU archive
+   (`onnxruntime-linux-x64-gpu-<version>.tgz`) from
+   [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases) and unpack
+   it. ONNX Runtime 1.27 and later is built for CUDA 13; use an older release or its
+   CUDA 12 variant with a CUDA 12 toolkit.
+3. **Model**: export to ONNX with a dynamic batch size, so several tiles run per call:
+
+   ```bash
+   libreyolo export --model LibreYOLO9t.pt --format onnx --imgsz 640 --dynamic
+   ```
+
+   The class names, input size and box format are read from the ONNX file's metadata.
+4. **Build**:
+
+   ```bash
+   cmake -B build -DONNXRUNTIME_ROOT=$HOME/onnxruntime-linux-x64-gpu-<version>
+   cmake --build build -j 2
+   ```
+
+   nvcc compiles the kernels for the GPU in the machine (CMake ≥ 3.24); otherwise pass
+   e.g. `-DCMAKE_CUDA_ARCHITECTURES=89`. If CMake can't find nvcc, add
+   `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`. The program finds
+   `libonnxruntime*.so` in the package directory by itself (RPATH).
 
 ```bash
-cmake -B build
+./build/yolov9_sahi models/LibreYOLO9t.onnx images/ -o results/ --csv detections.csv
+```
+
+The startup line shows the GPU (`CUDA (NVIDIA ...)`) and the batch size. `-b/--batch`
+sets the tiles per run (default 8); `--device` picks the GPU. The first run of a new
+batch size is slower while cuDNN picks its algorithms.
+
+### ncnn backend (CPU)
+
+```bash
+cmake -B build -DSAHI_BACKEND=NCNN
 cmake --build build -j 4
 ```
 
 Options:
 
 ```bash
-cmake -B build -DSAHI_VULKAN=ON        # ncnn with Vulkan GPU support (run with --gpu)
-cmake -B build -DSAHI_SYSTEM_NCNN=ON -Dncnn_DIR=<prefix>/lib/cmake/ncnn   # use an installed ncnn
+cmake -B build -DSAHI_BACKEND=NCNN -DSAHI_VULKAN=ON        # ncnn with Vulkan GPU support (run with --gpu)
+cmake -B build -DSAHI_BACKEND=NCNN -DSAHI_SYSTEM_NCNN=ON -Dncnn_DIR=<prefix>/lib/cmake/ncnn   # installed ncnn
 ```
 
-ncnn runs fast on CPU, so the default build is CPU-only. **WSL2:** Vulkan in WSL2 goes
-through Mesa's Dozen driver (Vulkan on Direct3D 12), which is very slow, so stay on CPU
-there, or build natively on Windows/Linux for `--gpu`.
+ncnn runs fast on CPU. **WSL2:** Vulkan in WSL2 goes through Mesa's Dozen driver (Vulkan
+on Direct3D 12), which is very slow, so use the CUDA backend for the GPU there.
 
 ## Run
 
-Arguments are, in order: the model's `.param` file, its `.bin` file, then one or more
-images and/or directories:
+Arguments are, in order, the model, then one or more images and/or directories:
 
 ```
-yolov9_sahi <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]
+yolov9_sahi <model.onnx> <image|dir> [<image|dir> ...] [options]                  # ORT_CUDA / ORT_CPU build
+yolov9_sahi <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]     # NCNN build
 ```
 
 ```bash
@@ -103,15 +157,17 @@ yolov9_sahi <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]
 | `--stride` | half a tile | tile stride in pixels (default: 50% overlap) |
 | `--margin` | 8 | drop detections within this many pixels of an interior tile edge |
 | `--pre-scale` | 1 | downscale the image by this factor (0–1] before tiling: fewer tiles, larger objects fit |
-| `-w, --workers` | physical cores | tiles run in parallel (OpenMP) |
-| `-t, --threads` | cores / workers | ncnn threads per tile |
-| `-j, --cores` | physical cores | total thread budget |
-| `--gpu` | off | Vulkan (needs `-DSAHI_VULKAN=ON`) |
+| `-b, --batch` | 8 | ONNX Runtime: tiles per inference run (models exported with a dynamic batch) |
+| `--device` | 0 | ORT_CUDA: GPU index |
+| `-w, --workers` | physical cores | ncnn: tiles run in parallel (OpenMP) |
+| `-t, --threads` | cores / workers | ncnn: threads per tile |
+| `-j, --cores` | physical cores | ncnn / ORT_CPU: total thread budget |
+| `--gpu` | off | ncnn: Vulkan (needs `-DSAHI_VULKAN=ON`) |
 | `--conf` | 0.25 | confidence threshold |
 | `--iou` | 0.45 | NMS IoU threshold, within a tile and for the final merge |
-| `--box` | `metadata.yaml`, else detected | box format in the output: `xyxy` or `cxcywh` |
-| `--pad` | `metadata.yaml`, else `center` | letterbox placement: `center` or `topleft` |
-| `--in`, `--out` | model's first input/output (`in0`, `out0`) | ncnn blob names |
+| `--box` | model metadata, else detected | box format in the output: `xyxy` or `cxcywh` |
+| `--pad` | `metadata.yaml`, else `center` | ncnn: letterbox placement: `center` or `topleft` |
+| `--in`, `--out` | model's first input/output | input/output names |
 
 ### How the tiling works
 

@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <map>
@@ -30,27 +31,32 @@
 #include <omp.h>
 #endif
 
+#include "detector.hpp"
+
+#if SAHI_NCNN
 #include "cpu.h"  // ncnn
 #include "net.h"
 #if NCNN_VULKAN
 #include "gpu.h"
 #endif
+#endif
+
+#if SAHI_ORT
+#include "ort_detector.hpp"
+#endif
+
+#if !SAHI_NCNN && !SAHI_ORT
+#error "Build with SAHI_NCNN=1 or SAHI_ORT=1 (set by CMakeLists.txt through SAHI_BACKEND)"
+#endif
 
 namespace fs = std::filesystem;
 
-struct Detection {
-    cv::Rect2f box;  // Global (x, y, width, height)
-    float confidence;
-    int class_id;
-};
-
-struct Region {
-    int x, y, width, height;
-};
-
 struct Options {
-    std::string param;                // model structure (.param)
-    std::string bin;                  // model weights (.bin)
+    std::string param;                // ncnn: model structure (.param)
+    std::string bin;                  // ncnn: model weights (.bin)
+    std::string onnx;                 // ONNX Runtime: model (.onnx)
+    int batch = 8;                    // ONNX Runtime: tiles per run (models with a dynamic batch)
+    int device = 0;                   // ONNX Runtime CUDA: GPU index
     std::vector<std::string> inputs;  // image files and/or directories
     std::string output;               // -o: output file (single image) or directory
     std::string csv_path;             // --csv: optional detections CSV
@@ -78,18 +84,28 @@ struct Options {
 // Thread budget: physical cores. ncnn's kernels share each core's vector units,
 // so hyperthreads add little and mostly cause contention.
 static int physical_cores() {
-    int n = ncnn::get_physical_big_cpu_count();
+    int n = 0;
+#if SAHI_NCNN
+    n = ncnn::get_physical_big_cpu_count();
     if (n <= 0) n = ncnn::get_physical_cpu_count();
+#endif
     if (n <= 0) n = static_cast<int>(std::thread::hardware_concurrency());
     return std::max(1, n);
 }
 
 static void print_usage(const char* prog) {
     std::cerr
+#if SAHI_NCNN
         << "Usage: " << prog << " <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]\n"
         << "\n"
         << "Loads the YOLOv9 ncnn model (.param, then .bin) once and runs tiled detection on every\n"
         << "image given.\n"
+#else
+        << "Usage: " << prog << " <model.onnx> <image|dir> [<image|dir> ...] [options]\n"
+        << "\n"
+        << "Loads the YOLOv9 ONNX model once (ONNX Runtime, " SAHI_ORT_DEVICE ") and runs tiled detection\n"
+        << "on every image given.\n"
+#endif
         << "Directories are scanned for .jpg/.jpeg/.png/.bmp/.tif/.tiff/.webp files (sorted by name).\n"
         << "\n"
         << "  -o, --output <path>    single image: output file (default: output.jpg)\n"
@@ -97,24 +113,40 @@ static void print_usage(const char* prog) {
         << "                         files are written as <name>_det.<ext>\n"
         << "      --csv <path>       also write all detections to a CSV file\n"
         << "  -n, --names <file>     class names, one per line: line 1 = class 0, line 2 = class 1, ...\n"
+#if SAHI_NCNN
         << "                         (default: names from a metadata.yaml next to the .param, if present)\n"
+#else
+        << "                         (default: names stored in the ONNX model, if present)\n"
+#endif
         << "  -r, --recursive        scan directories recursively\n"
-        << "  -s, --size <n>         model input size = tile size (default: imgsz from metadata.yaml, else 640)\n"
+        << "  -s, --size <n>         model input size = tile size (default: from the model's metadata, else 640)\n"
         << "      --stride <n>       tile stride in pixels (default: half a tile, i.e. 50% overlap)\n"
         << "      --margin <n>       drop detections within n px of an interior tile edge (default: 8)\n"
         << "      --pre-scale <f>    downscale the image by f (0 < f <= 1) before tiling (default: 1)\n"
+#if SAHI_NCNN
         << "  -w, --workers <n>      tiles run in parallel (default: one per core, never more than tiles)\n"
         << "  -t, --threads <n>      ncnn threads per tile (default: cores / workers)\n"
         << "  -j, --cores <n>        total thread budget (default: physical CPU cores)\n"
         << "      --gpu              use Vulkan (needs a build with -DSAHI_VULKAN=ON)\n"
+#else
+        << "  -b, --batch <n>        tiles per inference run, for models exported with a dynamic\n"
+        << "                         batch size (default: 8; fixed-batch models use their batch)\n"
+#if SAHI_ORT_CUDA
+        << "      --device <n>       CUDA device index (default: 0)\n"
+#else
+        << "  -j, --cores <n>        ONNX Runtime threads (default: physical CPU cores)\n"
+#endif
+#endif
         << "      --conf <c>         confidence threshold (default: 0.25)\n"
         << "      --iou <i>          NMS IoU threshold, per tile and for the final merge (default: 0.45)\n"
         << "      --box <fmt>        box format in the model output: xyxy (LibreYOLO) or cxcywh\n"
-        << "                         (default: from metadata.yaml, else detected from the output)\n"
+        << "                         (default: from the model's metadata, else detected from the output)\n"
+#if SAHI_NCNN
         << "      --pad <mode>       letterbox placement: center or topleft (LibreYOLO checkpoints)\n"
         << "                         (default: letterbox_pad from metadata.yaml, else center)\n"
-        << "      --in <blob>        input blob name (default: the model's first input, e.g. in0)\n"
-        << "      --out <blob>       output blob name (default: the model's first output, e.g. out0)\n";
+#endif
+        << "      --in <name>        input name (default: the model's first input)\n"
+        << "      --out <name>       output name (default: the model's first output)\n";
 }
 
 static bool parse_args(int argc, char** argv, Options& opt) {
@@ -142,6 +174,8 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "-t" || a == "--threads")   { if (!(v = next("--threads"))) return false; opt.threads_per_worker = std::atoi(v); }
         else if (a == "-j" || a == "--cores")     { if (!(v = next("--cores")))   return false; opt.cores = std::atoi(v); }
         else if (a == "--gpu")                    { opt.gpu = true; }
+        else if (a == "-b" || a == "--batch")     { if (!(v = next("--batch")))   return false; opt.batch = std::atoi(v); }
+        else if (a == "--device")                 { if (!(v = next("--device")))  return false; opt.device = std::atoi(v); }
         else if (a == "--conf")                   { if (!(v = next("--conf")))    return false; opt.conf = std::strtof(v, nullptr); }
         else if (a == "--iou")                    { if (!(v = next("--iou")))     return false; opt.nms_iou = std::strtof(v, nullptr); }
         else if (a == "--box")                    { if (!(v = next("--box")))     return false; opt.box = v; }
@@ -160,16 +194,32 @@ static bool parse_args(int argc, char** argv, Options& opt) {
     if (!(opt.pre_scale > 0.0f && opt.pre_scale <= 1.0f)) { std::cerr << "--pre-scale must be in (0, 1]\n"; return false; }
     if (opt.box != "auto" && opt.box != "xyxy" && opt.box != "cxcywh") { std::cerr << "--box must be xyxy or cxcywh\n"; return false; }
     if (opt.pad != "auto" && opt.pad != "center" && opt.pad != "topleft") { std::cerr << "--pad must be center or topleft\n"; return false; }
-    // Fixed order: <model.param> <model.bin> <image|dir> ...
-    if (positional.size() < 3) {
-        std::cerr << "Expected <model.param> <model.bin> and at least one image or directory\n";
-        return false;
-    }
+    if (opt.batch < 1) { std::cerr << "--batch must be at least 1\n"; return false; }
     auto has_ext = [](const std::string& f, const char* ext) {
         std::string e = fs::path(f).extension().string();
         std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return e == ext;
     };
+#if SAHI_ORT
+    // Fixed order: <model.onnx> <image|dir> ...
+    if (positional.size() < 2) {
+        std::cerr << "Expected <model.onnx> and at least one image or directory\n";
+        return false;
+    }
+    if (!has_ext(positional[0], ".onnx")) {
+        std::cerr << "First argument must be the .onnx model (got " << positional[0]
+                  << "); this build uses ONNX Runtime, configure with -DSAHI_BACKEND=NCNN for .param/.bin\n";
+        return false;
+    }
+    opt.onnx = positional[0];
+    opt.inputs.assign(positional.begin() + 1, positional.end());
+    return true;
+#else
+    // Fixed order: <model.param> <model.bin> <image|dir> ...
+    if (positional.size() < 3) {
+        std::cerr << "Expected <model.param> <model.bin> and at least one image or directory\n";
+        return false;
+    }
     if (!has_ext(positional[0], ".param")) {
         std::cerr << "First argument must be the model's .param file (got " << positional[0] << ")\n";
         return false;
@@ -182,14 +232,17 @@ static bool parse_args(int argc, char** argv, Options& opt) {
     opt.bin = positional[1];
     opt.inputs.assign(positional.begin() + 2, positional.end());
     return true;
+#endif
 }
 
+#if SAHI_NCNN
 static bool check_model_files(const fs::path& param, const fs::path& bin) {
     std::error_code ec;
     if (!fs::is_regular_file(param, ec)) { std::cerr << "Model file not found: " << param << "\n"; return false; }
     if (!fs::is_regular_file(bin, ec))   { std::cerr << "Weights file not found: " << bin << "\n"; return false; }
     return true;
 }
+#endif
 
 static bool is_image_file(const fs::path& p) {
     std::string ext = p.extension().string();
@@ -247,6 +300,7 @@ static bool load_class_names(const std::string& path, std::vector<std::string>& 
     return true;
 }
 
+#if SAHI_NCNN
 // What a metadata.yaml next to the .param can tell us. Exporters such as
 // LibreYOLO write one with the class names, input size and letterbox placement.
 struct ModelMetadata {
@@ -311,6 +365,7 @@ static ModelMetadata read_model_metadata(const fs::path& path) {
     }
     return md;
 }
+#endif  // SAHI_NCNN
 
 static std::string class_label(const std::vector<std::string>& names, int id) {
     if (id >= 0 && static_cast<size_t>(id) < names.size() && !names[id].empty()) return names[id];
@@ -353,42 +408,10 @@ static std::vector<Region> tile_grid(int img_w, int img_h, int size, int stride)
     return tiles;
 }
 
-// Class-aware NMS within one tile: classes don't suppress each other.
-// Output order is deterministic (sorted by class id).
-static std::vector<Detection> apply_class_aware_nms(const std::vector<Detection>& raw_dets,
-                                                    float conf_threshold, float nms_iou_threshold) {
-    std::vector<Detection> final_dets;
-    if (raw_dets.empty()) return final_dets;
-
-    std::map<int, std::vector<size_t>> class_indices;
-    for (size_t i = 0; i < raw_dets.size(); ++i) class_indices[raw_dets[i].class_id].push_back(i);
-
-    std::vector<const std::vector<size_t>*> groups;
-    groups.reserve(class_indices.size());
-    for (const auto& kv : class_indices) groups.push_back(&kv.second);
-
-    std::vector<std::vector<Detection>> kept(groups.size());
-
-    for (int g = 0; g < static_cast<int>(groups.size()); ++g) {
-        const auto& indices = *groups[g];
-        std::vector<cv::Rect2d> boxes;
-        std::vector<float> scores;
-        boxes.reserve(indices.size());
-        scores.reserve(indices.size());
-        for (size_t idx : indices) {
-            const auto& b = raw_dets[idx].box;
-            boxes.emplace_back(b.x, b.y, b.width, b.height);
-            scores.push_back(raw_dets[idx].confidence);
-        }
-        std::vector<int> keep_indices;
-        cv::dnn::NMSBoxes(boxes, scores, conf_threshold, nms_iou_threshold, keep_indices);
-        kept[g].reserve(keep_indices.size());
-        for (int k : keep_indices) kept[g].push_back(raw_dets[indices[k]]);
-    }
-
-    for (auto& v : kept) final_dets.insert(final_dets.end(), v.begin(), v.end());
-    return final_dets;
-}
+#if SAHI_NCNN
+// ---------------------------------------------------------------------------
+// ncnn backend
+// ---------------------------------------------------------------------------
 
 struct ModelInfo {
     std::string in_blob;
@@ -576,6 +599,72 @@ static ThreadPlan plan_threads(int cores, const Options& opt) {
     return p;
 }
 
+// Tiles in parallel with OpenMP, one Extractor per tile on a shared Net. An
+// image that is a single tile runs on `wide` (all cores in one extraction)
+// when the tile plan would leave cores idle; it is loaded on first use.
+class NcnnDetector : public TileDetector {
+public:
+    NcnnDetector(std::unique_ptr<ncnn::Net> net, std::function<std::unique_ptr<ncnn::Net>()> load_wide,
+                 const ModelInfo& mi, const ThreadPlan& plan, bool use_pools)
+        : net_(std::move(net)), load_wide_(std::move(load_wide)), mi_(mi), plan_(plan), use_pools_(use_pools) {
+        for (int w = 0; w < std::max(1, plan.workers); ++w) pools_.push_back(std::make_unique<WorkerPools>());
+    }
+
+    void prepare(size_t n_tiles) override {
+        if (n_tiles == 1 && load_wide_ && !wide_tried_) {
+            wide_tried_ = true;
+            wide_ = load_wide_();
+        }
+    }
+
+    int detect(const cv::Mat& work, const std::vector<Region>& tiles, float conf, float nms_iou,
+               std::vector<std::vector<Detection>>& per_tile) override {
+        per_tile.assign(tiles.size(), {});
+        int n_failed = 0;
+        if (tiles.size() == 1 && wide_) {
+            used_ = {1, wide_->opt.num_threads};
+            if (!detect_region(*wide_, mi_, work, tiles[0], conf, nms_iou, use_pools_ ? pools_[0].get() : nullptr,
+                               per_tile[0]))
+                ++n_failed;
+            return n_failed;
+        }
+        const int n_workers = std::max(1, std::min<int>(plan_.workers, static_cast<int>(tiles.size())));
+        used_ = {n_workers, plan_.threads};
+        (void)n_workers;  // unused without OpenMP
+
+        #pragma omp parallel for num_threads(n_workers) schedule(dynamic, 1) reduction(+ : n_failed)
+        for (int i = 0; i < static_cast<int>(tiles.size()); ++i) {
+#ifdef _OPENMP
+            WorkerPools* wp = use_pools_ ? pools_[omp_get_thread_num()].get() : nullptr;
+#else
+            WorkerPools* wp = use_pools_ ? pools_[0].get() : nullptr;
+#endif
+            if (!detect_region(*net_, mi_, work, tiles[i], conf, nms_iou, wp, per_tile[i])) ++n_failed;
+        }
+        return n_failed;
+    }
+
+    std::string last_run_desc() const override {
+        return std::to_string(used_.workers) + " x " + std::to_string(used_.threads) + " thr";
+    }
+
+private:
+    std::unique_ptr<ncnn::Net> net_;
+    std::function<std::unique_ptr<ncnn::Net>()> load_wide_;
+    std::unique_ptr<ncnn::Net> wide_;
+    bool wide_tried_ = false;
+    ModelInfo mi_;
+    ThreadPlan plan_;
+    bool use_pools_;
+    std::vector<std::unique_ptr<WorkerPools>> pools_;
+    ThreadPlan used_;
+};
+#endif  // SAHI_NCNN
+
+// ---------------------------------------------------------------------------
+// Tiled detection (shared by the backends)
+// ---------------------------------------------------------------------------
+
 // The image the tiles are cut from: optionally downscaled (fewer tiles), and
 // padded bottom/right with gray to at least one tile, so small images still
 // give a valid full-size tile. Padding at bottom/right keeps coordinates
@@ -596,70 +685,35 @@ static cv::Mat make_work_image(const cv::Mat& bgr, int size, float pre_scale, fl
     return work;
 }
 
-// Detect on all tiles of one image and merge. Results go into per-tile slots
-// and are concatenated in order, so the output does not depend on thread
-// scheduling. `wide` (all cores in one extraction) is used when the image is a
-// single tile and the tile plan would leave cores idle; it is null otherwise.
-static std::vector<Detection> run_tiled(const ncnn::Net& net, const ncnn::Net* wide, const ModelInfo& mi,
-                                        const cv::Mat& work, const std::vector<Region>& tiles, float inv_scale,
-                                        int img_w, int img_h, const ThreadPlan& plan,
-                                        std::vector<std::unique_ptr<WorkerPools>>& pools, bool use_pools,
-                                        const Options& opt, size_t& n_raw, int& failed, ThreadPlan& used) {
-    std::vector<std::vector<Detection>> per_tile(tiles.size());
-    int n_failed = 0;
-    const float margin = static_cast<float>(opt.margin);
+// Detect on all tiles of one image and merge. Results are concatenated in
+// tile order, so the output does not depend on thread scheduling.
+static std::vector<Detection> run_tiled(TileDetector& det, const cv::Mat& work, const std::vector<Region>& tiles,
+                                        float inv_scale, int img_w, int img_h, const Options& opt, size_t& n_raw,
+                                        int& failed) {
+    std::vector<std::vector<Detection>> per_tile;
+    failed = det.detect(work, tiles, opt.conf, opt.nms_iou, per_tile);
 
-    // Detect on one tile, then drop objects touching an *interior* tile edge:
-    // with 50% overlap the neighbouring tile sees them whole. Objects on a real
-    // image edge are kept. Coordinates stay in the work image.
-    auto process = [&](const ncnn::Net& n, int i, WorkerPools* wp) {
+    // Drop objects touching an *interior* tile edge: with 50% overlap the
+    // neighbouring tile sees them whole. Objects on a real image edge are kept.
+    // Then back to original-image coordinates (undo the pre-scale), clipped to
+    // the real image, i.e. without the gray padding.
+    const float margin = static_cast<float>(opt.margin);
+    const float max_x = static_cast<float>(img_w), max_y = static_cast<float>(img_h);
+    std::vector<Detection> all;
+    for (size_t i = 0; i < tiles.size(); ++i) {
         const Region& r = tiles[i];
-        std::vector<Detection> dets;
-        if (!detect_region(n, mi, work, r, opt.conf, opt.nms_iou, wp, dets)) return false;
         const bool left_interior = r.x > 0;
         const bool top_interior = r.y > 0;
         const bool right_interior = r.x + r.width < work.cols;
         const bool bottom_interior = r.y + r.height < work.rows;
-        auto& out = per_tile[i];
-        out.reserve(dets.size());
-        for (const Detection& d : dets) {
-            const float x0 = d.box.x - r.x, y0 = d.box.y - r.y;  // tile-local
-            const float x1 = x0 + d.box.width, y1 = y0 + d.box.height;
-            if (left_interior && x0 <= margin) continue;
-            if (top_interior && y0 <= margin) continue;
-            if (right_interior && x1 >= r.width - margin) continue;
-            if (bottom_interior && y1 >= r.height - margin) continue;
-            out.push_back(d);
-        }
-        return true;
-    };
+        for (Detection d : per_tile[i]) {
+            const float lx0 = d.box.x - r.x, ly0 = d.box.y - r.y;  // tile-local
+            const float lx1 = lx0 + d.box.width, ly1 = ly0 + d.box.height;
+            if (left_interior && lx0 <= margin) continue;
+            if (top_interior && ly0 <= margin) continue;
+            if (right_interior && lx1 >= r.width - margin) continue;
+            if (bottom_interior && ly1 >= r.height - margin) continue;
 
-    if (tiles.size() == 1 && wide) {
-        used = {1, wide->opt.num_threads};
-        if (!process(*wide, 0, use_pools ? pools[0].get() : nullptr)) ++n_failed;
-    } else {
-        const int n_workers = std::max(1, std::min<int>(plan.workers, static_cast<int>(tiles.size())));
-        used = {n_workers, plan.threads};
-        (void)n_workers;  // unused without OpenMP
-
-        #pragma omp parallel for num_threads(n_workers) schedule(dynamic, 1) reduction(+ : n_failed)
-        for (int i = 0; i < static_cast<int>(tiles.size()); ++i) {
-#ifdef _OPENMP
-            WorkerPools* wp = use_pools ? pools[omp_get_thread_num()].get() : nullptr;
-#else
-            WorkerPools* wp = use_pools ? pools[0].get() : nullptr;
-#endif
-            if (!process(net, i, wp)) ++n_failed;
-        }
-    }
-    failed = n_failed;
-
-    // Back to original-image coordinates (undo the pre-scale), clipped to the
-    // real image, i.e. without the gray padding.
-    std::vector<Detection> all;
-    const float max_x = static_cast<float>(img_w), max_y = static_cast<float>(img_h);
-    for (auto& v : per_tile) {
-        for (Detection d : v) {
             const float x0 = std::min(d.box.x * inv_scale, max_x);
             const float y0 = std::min(d.box.y * inv_scale, max_y);
             const float x1 = std::min((d.box.x + d.box.width) * inv_scale, max_x);
@@ -724,16 +778,7 @@ int main(int argc, char** argv) {
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
 
-    const fs::path param_path(opt.param), bin_path(opt.bin);
-    if (!check_model_files(param_path, bin_path)) return 1;
-
-    // Class names, input size, box format and letterbox placement: command-line
-    // options win; otherwise a metadata.yaml next to the .param; otherwise defaults.
     std::vector<std::string> class_names;
-    const fs::path meta_path = param_path.parent_path() / "metadata.yaml";
-    const ModelMetadata md = read_model_metadata(meta_path);
-    const std::vector<std::string>& meta_names = md.names;
-    const int meta_imgsz = md.imgsz;
     std::string names_source;
     if (!opt.names_path.empty()) {
         if (!load_class_names(opt.names_path, class_names)) {
@@ -741,11 +786,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         names_source = opt.names_path;
-    } else if (!meta_names.empty()) {
-        class_names = meta_names;
-        names_source = meta_path.string();
     }
-    if (opt.size == 0) opt.size = meta_imgsz >= 32 ? meta_imgsz : 640;
 
     std::vector<fs::path> images = collect_images(opt.inputs, opt.recursive);
     if (images.empty()) {
@@ -780,139 +821,182 @@ int main(int argc, char** argv) {
         return out_dir / name;
     };
 
-    // ---- Load the model once. One Net is shared by all workers: each tile gets
-    //      its own Extractor, which ncnn allows concurrently. ----
     const int cores = opt.cores > 0 ? opt.cores : physical_cores();
-    const ThreadPlan plan = plan_threads(cores, opt);
+    std::unique_ptr<TileDetector> detector;
+    std::string model_line;  // startup summary of the model and how it runs
+    int tile_size = 0;
 
-    bool use_gpu = false;
-    std::string device = "CPU";
-    if (opt.gpu) {
-#if NCNN_VULKAN
-        if (ncnn::get_gpu_count() > 0) {
-            use_gpu = true;
-            device = std::string("Vulkan (") + ncnn::get_gpu_info(0).device_name() + ")";
-        } else {
-            std::cerr << "Warning: no Vulkan device found; using CPU\n";
-        }
-#else
-        std::cerr << "Warning: built without Vulkan (configure with -DSAHI_VULKAN=ON); using CPU\n";
-#endif
-    }
-
-    auto load_net = [&](ncnn::Net& n, int threads, bool concurrent) {
-        n.opt.num_threads = threads;
-        n.opt.lightmode = true;  // free intermediate blobs as soon as possible
-        n.opt.use_vulkan_compute = use_gpu;
-        // With several tiles in flight, idle ncnn threads must not spin-wait
-        // for work (default 20 ms): they would burn cores other tiles need.
-        n.opt.openmp_blocktime = concurrent ? 0 : 20;
-        if (n.load_param(param_path.string().c_str()) != 0) {
-            std::cerr << "Failed to load " << param_path << "\n";
-            return false;
-        }
-        if (n.load_model(bin_path.string().c_str()) != 0) {
-            std::cerr << "Failed to load " << bin_path << "\n";
-            return false;
-        }
-        return true;
-    };
-
-    ncnn::Net net;
-    if (!load_net(net, plan.threads, plan.workers > 1)) return 1;
-
-#ifdef _OPENMP
-    // Nested OpenMP only when both levels have threads to use.
-    omp_set_max_active_levels(plan.workers > 1 && plan.threads > 1 ? 2 : 1);
-#endif
-
-    // Images that fit in one tile get no tile parallelism; when the tile plan
-    // leaves cores idle, those run on a second copy of the model loaded with
-    // all cores. Loaded only when such an image first shows up.
-    std::unique_ptr<ncnn::Net> wide_net;
-    bool wide_tried = false;
-    auto get_wide = [&]() -> const ncnn::Net* {
-        if (use_gpu || plan.threads >= cores) return nullptr;
-        if (!wide_tried) {
-            wide_tried = true;
-            auto n = std::make_unique<ncnn::Net>();
-            if (load_net(*n, cores, false)) wide_net = std::move(n);
-        }
-        return wide_net.get();
-    };
-
-    // One memory pool pair per worker (CPU only; Vulkan uses its own allocators)
-    const bool use_pools = !use_gpu;
-    std::vector<std::unique_ptr<WorkerPools>> pools;
-    for (int w = 0; w < std::max(1, plan.workers); ++w) pools.push_back(std::make_unique<WorkerPools>());
-
-    ModelInfo mi;
-    mi.size = opt.size;
-    std::string pad_source = "default";
-    if (opt.pad != "auto") {
-        mi.topleft = opt.pad == "topleft";
-        pad_source = "--pad";
-    } else if (md.letterbox_pad == "topleft" || md.letterbox_pad == "center" || md.letterbox_pad == "centre") {
-        mi.topleft = md.letterbox_pad == "topleft";
-        pad_source = "metadata.yaml";
-    }
-    mi.in_blob = opt.in_blob;
-    mi.out_blob = opt.out_blob;
-    if (mi.in_blob.empty()) {
-        if (net.input_names().empty()) { std::cerr << "Model has no input blob; pass --in\n"; return 1; }
-        mi.in_blob = net.input_names()[0];
-    }
-    if (mi.out_blob.empty()) {
-        if (net.output_names().empty()) { std::cerr << "Model has no output blob; pass --out\n"; return 1; }
-        mi.out_blob = net.output_names()[0];
-    }
-    const int stride = opt.stride > 0 ? opt.stride : std::max(1, opt.size / 2);
-
-    // Check the blob names and output layout once, on a blank input, so a wrong
-    // --in/--out or an unsupported model fails here instead of on every tile.
-    // The same output tells us the box format when nothing else does.
-    std::string box_source;
+#if SAHI_ORT
+    // ---- ONNX Runtime: one session; tiles run in batches ----
     {
-        ncnn::Mat probe(mi.size, mi.size, 3);
-        probe.fill(0.5f);
-        ncnn::Extractor ex = net.create_extractor();
-        ncnn::Mat out;
-        if (ex.input(mi.in_blob.c_str(), probe) != 0 || ex.extract(mi.out_blob.c_str(), out) != 0) {
-            std::cerr << "Cannot run the model with input '" << mi.in_blob << "' and output '" << mi.out_blob
-                      << "'. Model inputs:";
-            for (const char* n : net.input_names()) std::cerr << ' ' << n;
-            std::cerr << " | outputs:";
-            for (const char* n : net.output_names()) std::cerr << ' ' << n;
-            std::cerr << "\nPass the right names with --in / --out.\n";
+        OrtConfig cfg;
+        cfg.model_path = opt.onnx;
+        cfg.size = opt.size;
+        cfg.batch = opt.batch;
+        cfg.device = opt.device;
+        cfg.threads = cores;
+        cfg.box = opt.box;
+        cfg.in_name = opt.in_blob;
+        cfg.out_name = opt.out_blob;
+        std::error_code ec;
+        if (!fs::is_regular_file(cfg.model_path, ec)) {
+            std::cerr << "Model file not found: " << cfg.model_path << "\n";
             return 1;
         }
-        HeadView v;
-        if (!make_head_view(out, v)) return 1;
-        if (opt.box != "auto") {
-            mi.xyxy = opt.box == "xyxy";
-            box_source = "--box";
-        } else if (md.libreyolo && md.model_family.rfind("yolo9", 0) == 0) {
-            mi.xyxy = true;  // LibreYOLO's YOLOv9 head exports xyxy boxes
-            box_source = "metadata.yaml";
-        } else {
-            mi.xyxy = looks_like_xyxy(v);
-            box_source = "detected";
+        OrtModelInfo info;
+        std::string error;
+        detector = create_ort_detector(cfg, info, error);
+        if (!detector) {
+            std::cerr << "Failed to load " << cfg.model_path << ": " << error << "\n";
+            return 1;
         }
+        tile_size = info.size;
+        if (names_source.empty() && !info.names.empty()) {
+            class_names = info.names;
+            names_source = "model metadata";
+        }
+        model_line = "Model: " + cfg.model_path + " (" + info.in_name + " -> " + info.out_name + ", input " +
+                     std::to_string(info.size) + "x" + std::to_string(info.size) + ", boxes " +
+                     (info.xyxy ? "xyxy" : "cxcywh") + " (" + info.box_source + ")) | " + info.device +
+                     " | batch " + std::to_string(info.batch) + (info.dynamic_batch ? "" : " (fixed by the model)");
     }
+#else
+    // ---- ncnn: one Net shared by all workers; each tile gets its own Extractor ----
+    {
+        const fs::path param_path(opt.param), bin_path(opt.bin);
+        if (!check_model_files(param_path, bin_path)) return 1;
 
-    const std::string plan_desc = std::to_string(cores) + " cores: " + std::to_string(plan.workers) +
-                                  " tile(s) in parallel x " + std::to_string(plan.threads) + " thread(s)";
+        // Class names, input size, box format and letterbox placement: command-line
+        // options win; otherwise a metadata.yaml next to the .param; otherwise defaults.
+        const fs::path meta_path = param_path.parent_path() / "metadata.yaml";
+        const ModelMetadata md = read_model_metadata(meta_path);
+        if (names_source.empty() && !md.names.empty()) {
+            class_names = md.names;
+            names_source = meta_path.string();
+        }
+        if (opt.size == 0) opt.size = md.imgsz >= 32 ? md.imgsz : 640;
 
-    const double init_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-    std::cout << "Model: " << param_path.string() << " + " << bin_path.filename().string() << " (" << mi.in_blob << " -> " << mi.out_blob
-              << ", input " << mi.size << "x" << mi.size << ", boxes " << (mi.xyxy ? "xyxy" : "cxcywh")
-              << " (" << box_source << "), pad " << (mi.topleft ? "topleft" : "center") << " (" << pad_source
-              << ")) | " << device << " | " << plan_desc
-#ifndef _OPENMP
-              << " [built without OpenMP: tiles run sequentially]"
+        const ThreadPlan plan = plan_threads(cores, opt);
+
+        bool use_gpu = false;
+        std::string device = "CPU";
+        if (opt.gpu) {
+#if NCNN_VULKAN
+            if (ncnn::get_gpu_count() > 0) {
+                use_gpu = true;
+                device = std::string("Vulkan (") + ncnn::get_gpu_info(0).device_name() + ")";
+            } else {
+                std::cerr << "Warning: no Vulkan device found; using CPU\n";
+            }
+#else
+            std::cerr << "Warning: built without Vulkan (configure with -DSAHI_VULKAN=ON); using CPU\n";
 #endif
-              << "\n"
-              << "Tiles: " << mi.size << "x" << mi.size << ", stride " << stride << ", edge margin " << opt.margin
+        }
+
+        auto load_net = [=](int threads, bool concurrent) -> std::unique_ptr<ncnn::Net> {
+            auto n = std::make_unique<ncnn::Net>();
+            n->opt.num_threads = threads;
+            n->opt.lightmode = true;  // free intermediate blobs as soon as possible
+            n->opt.use_vulkan_compute = use_gpu;
+            // With several tiles in flight, idle ncnn threads must not spin-wait
+            // for work (default 20 ms): they would burn cores other tiles need.
+            n->opt.openmp_blocktime = concurrent ? 0 : 20;
+            if (n->load_param(param_path.string().c_str()) != 0) {
+                std::cerr << "Failed to load " << param_path << "\n";
+                return nullptr;
+            }
+            if (n->load_model(bin_path.string().c_str()) != 0) {
+                std::cerr << "Failed to load " << bin_path << "\n";
+                return nullptr;
+            }
+            return n;
+        };
+
+        std::unique_ptr<ncnn::Net> net = load_net(plan.threads, plan.workers > 1);
+        if (!net) return 1;
+
+#ifdef _OPENMP
+        // Nested OpenMP only when both levels have threads to use.
+        omp_set_max_active_levels(plan.workers > 1 && plan.threads > 1 ? 2 : 1);
+#endif
+
+        ModelInfo mi;
+        mi.size = opt.size;
+        std::string pad_source = "default";
+        if (opt.pad != "auto") {
+            mi.topleft = opt.pad == "topleft";
+            pad_source = "--pad";
+        } else if (md.letterbox_pad == "topleft" || md.letterbox_pad == "center" || md.letterbox_pad == "centre") {
+            mi.topleft = md.letterbox_pad == "topleft";
+            pad_source = "metadata.yaml";
+        }
+        mi.in_blob = opt.in_blob;
+        mi.out_blob = opt.out_blob;
+        if (mi.in_blob.empty()) {
+            if (net->input_names().empty()) { std::cerr << "Model has no input blob; pass --in\n"; return 1; }
+            mi.in_blob = net->input_names()[0];
+        }
+        if (mi.out_blob.empty()) {
+            if (net->output_names().empty()) { std::cerr << "Model has no output blob; pass --out\n"; return 1; }
+            mi.out_blob = net->output_names()[0];
+        }
+
+        // Check the blob names and output layout once, on a blank input, so a wrong
+        // --in/--out or an unsupported model fails here instead of on every tile.
+        // The same output tells us the box format when nothing else does.
+        std::string box_source;
+        {
+            ncnn::Mat probe(mi.size, mi.size, 3);
+            probe.fill(0.5f);
+            ncnn::Extractor ex = net->create_extractor();
+            ncnn::Mat out;
+            if (ex.input(mi.in_blob.c_str(), probe) != 0 || ex.extract(mi.out_blob.c_str(), out) != 0) {
+                std::cerr << "Cannot run the model with input '" << mi.in_blob << "' and output '" << mi.out_blob
+                          << "'. Model inputs:";
+                for (const char* n : net->input_names()) std::cerr << ' ' << n;
+                std::cerr << " | outputs:";
+                for (const char* n : net->output_names()) std::cerr << ' ' << n;
+                std::cerr << "\nPass the right names with --in / --out.\n";
+                return 1;
+            }
+            HeadView v;
+            if (!make_head_view(out, v)) return 1;
+            if (opt.box != "auto") {
+                mi.xyxy = opt.box == "xyxy";
+                box_source = "--box";
+            } else if (md.libreyolo && md.model_family.rfind("yolo9", 0) == 0) {
+                mi.xyxy = true;  // LibreYOLO's YOLOv9 head exports xyxy boxes
+                box_source = "metadata.yaml";
+            } else {
+                mi.xyxy = looks_like_xyxy(v);
+                box_source = "detected";
+            }
+        }
+
+        // Images that fit in one tile get no tile parallelism; when the tile plan
+        // leaves cores idle, those run on a second copy of the model with all cores.
+        std::function<std::unique_ptr<ncnn::Net>()> load_wide;
+        if (!use_gpu && plan.threads < cores) load_wide = [=]() { return load_net(cores, false); };
+
+        tile_size = mi.size;
+        model_line = "Model: " + param_path.string() + " + " + bin_path.filename().string() + " (" + mi.in_blob +
+                     " -> " + mi.out_blob + ", input " + std::to_string(mi.size) + "x" + std::to_string(mi.size) +
+                     ", boxes " + (mi.xyxy ? "xyxy" : "cxcywh") + " (" + box_source + "), pad " +
+                     (mi.topleft ? "topleft" : "center") + " (" + pad_source + ")) | " + device + " | " +
+                     std::to_string(cores) + " cores: " + std::to_string(plan.workers) + " tile(s) in parallel x " +
+                     std::to_string(plan.threads) + " thread(s)"
+#ifndef _OPENMP
+                     + " [built without OpenMP: tiles run sequentially]"
+#endif
+            ;
+        detector = std::make_unique<NcnnDetector>(std::move(net), load_wide, mi, plan, !use_gpu);
+    }
+#endif
+
+    const int stride = opt.stride > 0 ? opt.stride : std::max(1, tile_size / 2);
+    const double init_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+    std::cout << model_line << "\n"
+              << "Tiles: " << tile_size << "x" << tile_size << ", stride " << stride << ", edge margin " << opt.margin
               << (opt.pre_scale < 1.0f ? ", pre-scale " + std::to_string(opt.pre_scale).substr(0, 4) : std::string())
               << " | " << images.size() << " image(s)";
     if (!names_source.empty()) std::cout << " | " << class_names.size() << " class names from " << names_source;
@@ -934,7 +1018,6 @@ int main(int argc, char** argv) {
     auto load = [](const fs::path& p) { return cv::imread(p.string(), cv::IMREAD_COLOR); };
     std::future<cv::Mat> next = std::async(std::launch::async, load, images[0]);
     std::future<bool> pending_save;
-    clock::duration ti_offset = clock::duration::zero();
     size_t unsaved = 0;
 
     for (size_t idx = 0; idx < images.size(); ++idx) {
@@ -951,22 +1034,16 @@ int main(int argc, char** argv) {
 
         size_t n_raw = 0;
         int failed = 0;
-        ThreadPlan used;
-        const auto ti = clock::now();
         float inv_scale = 1.0f;
-        const cv::Mat work = make_work_image(bgr, mi.size, opt.pre_scale, inv_scale);
-        const std::vector<Region> tiles = tile_grid(work.cols, work.rows, mi.size, stride);
-        const size_t n_regions = tiles.size();
-        const ncnn::Net* wide = nullptr;
-        if (tiles.size() == 1) {
-            const auto tw = clock::now();
-            wide = get_wide();  // loaded on first use; not counted as inference time
-            if (wide) ti_offset += clock::now() - tw;
-        }
-        std::vector<Detection> merged = run_tiled(net, wide, mi, work, tiles, inv_scale, bgr.cols, bgr.rows, plan,
-                                                  pools, use_pools, opt, n_raw, failed, used);
-        const double infer_ms = std::chrono::duration<double, std::milli>(clock::now() - ti - ti_offset).count();
-        ti_offset = clock::duration::zero();
+        const auto tp = clock::now();
+        const cv::Mat work = make_work_image(bgr, tile_size, opt.pre_scale, inv_scale);
+        const std::vector<Region> tiles = tile_grid(work.cols, work.rows, tile_size, stride);
+        const auto prep_time = clock::now() - tp;
+        detector->prepare(tiles.size());  // may load something on first use: not timed
+        const auto ti = clock::now();
+        std::vector<Detection> merged = run_tiled(*detector, work, tiles, inv_scale, bgr.cols, bgr.rows, opt,
+                                                  n_raw, failed);
+        const double infer_ms = std::chrono::duration<double, std::milli>(clock::now() - ti + prep_time).count();
 
         if (!class_names.empty()) {
             for (const auto& d : merged) {
@@ -999,12 +1076,12 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::printf("%zu tiles (%d x %d thr), %zu raw -> %zu dets, %.1f ms%s\n",
-                    n_regions, used.workers, used.threads, n_raw, merged.size(), infer_ms,
-                    failed ? (" | " + std::to_string(failed) + " region(s) failed").c_str() : "");
+        std::printf("%zu tiles (%s), %zu raw -> %zu dets, %.1f ms%s\n", tiles.size(),
+                    detector->last_run_desc().c_str(), n_raw, merged.size(), infer_ms,
+                    failed ? (" | " + std::to_string(failed) + " tile(s) failed").c_str() : "");
         std::fflush(stdout);
 
-        if (failed == static_cast<int>(n_regions)) ++failed_images; else ++ok_images;
+        if (failed == static_cast<int>(tiles.size())) ++failed_images; else ++ok_images;
         total_dets += merged.size();
         total_infer_ms += infer_ms;
     }
