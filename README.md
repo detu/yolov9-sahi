@@ -1,9 +1,10 @@
 # yolov9-sahi
 
-YOLOv9 inference using [ncnn](https://github.com/Tencent/ncnn) for a full image utilizing the
-SAHI method (Slicing Aided Hyper Inference): the image is cut into overlapping tiles at
-the model's input size, each tile is run through YOLOv9, and detections are mapped back
-and merged across tiles. Small objects in large images stay at native resolution.
+YOLOv9 inference using [ncnn](https://github.com/Tencent/ncnn) for a full image using
+tiling: the image is cut into model-sized tiles overlapping by 50%, each tile is run
+through YOLOv9 at native resolution, detections cut by an interior tile edge are dropped
+(the neighbouring tile sees those objects whole), and the rest are merged with one NMS.
+Small objects in large images stay at native resolution.
 
 ## Layout
 
@@ -94,43 +95,54 @@ yolov9_sahi <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-o, --output` | `sahi_output.jpg` / `sahi_output/` | output file for one image, output directory for several (`<name>_sahi.<ext>`) |
+| `-o, --output` | `output.jpg` / `output/` | output file for one image, output directory for several (`<name>_det.<ext>`) |
 | `--csv` | off | write all detections: `image,class_id,class_name,score,x1,y1,x2,y2` |
 | `-n, --names` | `metadata.yaml` | text file of class names, one per line: line 1 = class 0, line 2 = class 1, ... |
 | `-r, --recursive` | off | scan directories recursively |
-| `-s, --size` | `metadata.yaml` imgsz, else 640 | model input size |
-| `--slice` | input size | tile size (tiles are letterboxed to the input size) |
-| `--full` | off | also detect on the whole image (catches objects larger than a tile) |
+| `-s, --size` | `metadata.yaml` imgsz, else 640 | model input size = tile size |
+| `--stride` | half a tile | tile stride in pixels (default: 50% overlap) |
+| `--margin` | 8 | drop detections within this many pixels of an interior tile edge |
+| `--pre-scale` | 1 | downscale the image by this factor (0–1] before tiling: fewer tiles, larger objects fit |
 | `-w, --workers` | physical cores | tiles run in parallel (OpenMP) |
 | `-t, --threads` | cores / workers | ncnn threads per tile |
 | `-j, --cores` | physical cores | total thread budget |
 | `--gpu` | off | Vulkan (needs `-DSAHI_VULKAN=ON`) |
-| `--overlap` | 0.20 | tile overlap ratio |
 | `--conf` | 0.25 | confidence threshold |
-| `--iou` | 0.45 | NMS IoU threshold within a tile |
-| `--merge` | `nmm` | merging across tiles: `nmm` merges overlapping boxes into one, `nms` keeps the best |
-| `--match` | `ios` | overlap metric for the merge: `ios` (intersection over smaller box) or `iou` |
-| `--match-thresh` | 0.5 | overlap above which boxes are merged |
+| `--iou` | 0.45 | NMS IoU threshold, within a tile and for the final merge |
 | `--box` | `metadata.yaml`, else detected | box format in the output: `xyxy` or `cxcywh` |
 | `--pad` | `metadata.yaml`, else `center` | letterbox placement: `center` or `topleft` |
 | `--in`, `--out` | model's first input/output (`in0`, `out0`) | ncnn blob names |
 
-Each tile is letterboxed (gray padding, centred or top-left) to the input size, normalized
-to 0–1 RGB and run through the network; boxes are decoded (best class per anchor), mapped
-back to the image and de-duplicated within the tile with class-aware NMS. Output is
-deterministic regardless of the number of threads.
+### How the tiling works
 
-Across tiles, an object cut by a tile edge appears as a full box from one tile plus a
-fragment from its neighbour, or as two halves. As in the SAHI library, the default merge
-is greedy NMM with the IOS metric: boxes of the same class whose intersection covers more
-than half of the smaller box are merged into their union, keeping the best score. Use
-`--merge nms --match iou` for plain NMS. SAHI works best when objects are smaller than a
-tile; add `--full` when the images also contain objects much larger than a tile.
+1. **Work image.** With `--pre-scale f < 1` the image is first downscaled (area
+   averaging). If it is smaller than one tile, it is padded at the bottom/right with gray
+   (114) to one tile, so coordinates don't move.
+2. **Tile grid.** Tiles are `size × size` (the model input size) at every `stride` pixels
+   (default half a tile, i.e. 50% overlap). The number of tiles per row/column is the
+   smallest that covers the image, and the last tile is clamped to the image border, so
+   there are no partial or duplicate tiles. Tiles are read in place, not copied.
+3. **Per tile.** The tile is normalized to 0–1 RGB and run through YOLOv9; boxes are
+   decoded (best class per anchor) and de-duplicated with class-aware NMS.
+4. **Edge filter.** A detection within `--margin` pixels of an *interior* tile edge (an
+   edge that isn't the image border) is dropped: it is probably cut, and with 50% overlap
+   the neighbouring tile sees the object whole. Detections on the real image border are
+   kept.
+5. **Merge.** The rest is mapped back to the original image (undoing the pre-scale),
+   clipped to the real image (dropping the gray padding) and merged with one class-aware
+   NMS, which removes objects seen whole by two overlapping tiles.
+
+Output is deterministic regardless of the number of threads.
+
+Objects larger than about a tile can't be seen whole by any tile, so the edge filter
+drops them. Use `--pre-scale` to shrink such images until the large objects fit in a
+tile. For example, `--pre-scale 0.5` turns a 4000 px wide image into tiles that cover
+1280 px of the original.
 
 ### Threading
 
 By default the program runs **one tile per physical core, with ncnn single-threaded**.
-SAHI produces many equal tiles, and running them side by side scales almost linearly,
+Tiling produces many equal tiles, and running them side by side scales almost linearly,
 while ncnn's own per-layer threading scales worse on a single 640×640 tile and nesting the
 two levels costs extra. Measured on 2 cores with YOLOv9-C, 35 tiles:
 
