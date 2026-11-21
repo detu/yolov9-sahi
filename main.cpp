@@ -51,6 +51,8 @@ struct Options {
     std::string csv_path;             // --csv: optional detections CSV
     std::string names_path;           // --names: class names, one per line (line 1 = class 0)
     std::string in_blob, out_blob;    // ncnn blob names (default: first input/output)
+    std::string box = "auto";         // box format in the output: auto, xyxy or cxcywh
+    std::string pad = "auto";         // letterbox placement: auto, center or topleft
     bool recursive = false;
     bool full = false;                // also run on the whole (letterboxed) image
     bool gpu = false;                 // Vulkan, if ncnn was built with it
@@ -90,7 +92,7 @@ static void print_usage(const char* prog) {
         << "                         files are written as <name>_sahi.<ext>\n"
         << "      --csv <path>       also write all detections to a CSV file\n"
         << "  -n, --names <file>     class names, one per line: line 1 = class 0, line 2 = class 1, ...\n"
-        << "                         (default: names from metadata.yaml next to the model, if present)\n"
+        << "                         (default: names from a metadata.yaml next to the .param, if present)\n"
         << "  -r, --recursive        scan directories recursively\n"
         << "  -s, --size <n>         model input size (default: imgsz from metadata.yaml, else 640)\n"
         << "      --slice <n>        tile size (default: model input size)\n"
@@ -106,6 +108,10 @@ static void print_usage(const char* prog) {
         << "      --match <m>        overlap metric for the merge: ios = intersection over the smaller box\n"
         << "                         (default; joins objects cut by a tile edge), iou = intersection over union\n"
         << "      --match-thresh <t> overlap above which boxes are merged (default: 0.5)\n"
+        << "      --box <fmt>        box format in the model output: xyxy (LibreYOLO) or cxcywh\n"
+        << "                         (default: from metadata.yaml, else detected from the output)\n"
+        << "      --pad <mode>       letterbox placement: center or topleft (LibreYOLO checkpoints)\n"
+        << "                         (default: letterbox_pad from metadata.yaml, else center)\n"
         << "      --in <blob>        input blob name (default: the model's first input, e.g. in0)\n"
         << "      --out <blob>       output blob name (default: the model's first output, e.g. out0)\n";
 }
@@ -142,6 +148,8 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "--merge")                  { if (!(v = next("--merge")))   return false; opt.merge = v; }
         else if (a == "--match")                  { if (!(v = next("--match")))   return false; opt.match = v; }
         else if (a == "--match-thresh")           { if (!(v = next("--match-thresh"))) return false; opt.match_thresh = std::strtof(v, nullptr); }
+        else if (a == "--box")                    { if (!(v = next("--box")))     return false; opt.box = v; }
+        else if (a == "--pad")                    { if (!(v = next("--pad")))     return false; opt.pad = v; }
         else if (a == "--in")                     { if (!(v = next("--in")))      return false; opt.in_blob = v; }
         else if (a == "--out")                    { if (!(v = next("--out")))     return false; opt.out_blob = v; }
         else if (!a.empty() && a[0] == '-')       { std::cerr << "Unknown option: " << a << "\n"; return false; }
@@ -155,6 +163,8 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         std::cerr << "--overlap must be in [0, 1)\n";
         return false;
     }
+    if (opt.box != "auto" && opt.box != "xyxy" && opt.box != "cxcywh") { std::cerr << "--box must be xyxy or cxcywh\n"; return false; }
+    if (opt.pad != "auto" && opt.pad != "center" && opt.pad != "topleft") { std::cerr << "--pad must be center or topleft\n"; return false; }
     if (opt.merge != "nmm" && opt.merge != "nms") { std::cerr << "--merge must be nmm or nms\n"; return false; }
     if (opt.match != "ios" && opt.match != "iou") { std::cerr << "--match must be ios or iou\n"; return false; }
     // Fixed order: <model.param> <model.bin> <image|dir> ...
@@ -244,11 +254,22 @@ static bool load_class_names(const std::string& path, std::vector<std::string>& 
     return true;
 }
 
-// Minimal reader for the metadata.yaml that Ultralytics writes next to an
-// exported model: picks up `imgsz` and the `names` mapping (0: person, ...).
-static void read_ultralytics_metadata(const fs::path& path, std::vector<std::string>& names, int& imgsz) {
+// What a metadata.yaml next to the .param can tell us. Exporters such as
+// LibreYOLO write one with the class names, input size and letterbox placement.
+struct ModelMetadata {
+    std::vector<std::string> names;
+    int imgsz = 0;
+    std::string letterbox_pad;  // "center" / "topleft" (LibreYOLO)
+    std::string model_family;   // e.g. "yolo9", "yolo9_e2e" (LibreYOLO)
+    bool libreyolo = false;     // written by LibreYOLO (boxes are xyxy)
+};
+
+// Minimal reader for that file: flat "key: value" lines plus the `names`
+// mapping (0: person / '0': person) and `imgsz` (640, [640, 640] or a list).
+static ModelMetadata read_model_metadata(const fs::path& path) {
+    ModelMetadata md;
     std::ifstream f(path);
-    if (!f) return;
+    if (!f) return md;
     auto trim = [](std::string t) {
         const auto b = t.find_first_not_of(" \t\r");
         const auto e = t.find_last_not_of(" \t\r");
@@ -262,33 +283,40 @@ static void read_ultralytics_metadata(const fs::path& path, std::vector<std::str
     std::string section, line;
     while (std::getline(f, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (trim(line).empty()) continue;
+        if (trim(line).empty() || trim(line)[0] == '#') continue;
         const bool indented = line[0] == ' ' || line[0] == '\t' || line[0] == '-';
         const std::string t = trim(line);
         if (!indented) {
             const auto colon = t.find(':');
-            section = colon == std::string::npos ? "" : t.substr(0, colon);
-            const std::string rest = colon == std::string::npos ? "" : trim(t.substr(colon + 1));
-            if (section == "imgsz" && !rest.empty()) {  // inline form: imgsz: [640, 640] or imgsz: 640
+            section = colon == std::string::npos ? "" : unquote(trim(t.substr(0, colon)));
+            const std::string rest = colon == std::string::npos ? "" : unquote(trim(t.substr(colon + 1)));
+            if (section == "imgsz" && !rest.empty()) {  // imgsz: 640 or imgsz: [640, 640]
                 const auto d = rest.find_first_of("0123456789");
-                if (d != std::string::npos) imgsz = std::atoi(rest.c_str() + d);
+                if (d != std::string::npos) md.imgsz = std::atoi(rest.c_str() + d);
+            } else if (section == "letterbox_pad") {
+                md.letterbox_pad = rest;
+            } else if (section == "model_family") {
+                md.model_family = rest;
+            } else if (section == "libreyolo_version") {
+                md.libreyolo = true;
             }
             continue;
         }
-        if (section == "imgsz" && t[0] == '-' && imgsz == 0) {  // block form: "- 640"
-            imgsz = std::atoi(trim(t.substr(1)).c_str());
+        if (section == "imgsz" && t[0] == '-' && md.imgsz == 0) {  // block list: "- 640"
+            md.imgsz = std::atoi(trim(t.substr(1)).c_str());
         } else if (section == "names") {
             const auto colon = t.find(':');
             if (colon == std::string::npos) continue;
-            const std::string key = trim(t.substr(0, colon));
+            const std::string key = unquote(trim(t.substr(0, colon)));
             if (key.empty() || key.find_first_not_of("0123456789") != std::string::npos) continue;
             by_id[std::atoi(key.c_str())] = unquote(trim(t.substr(colon + 1)));
         }
     }
     if (!by_id.empty()) {
-        names.assign(static_cast<size_t>(by_id.rbegin()->first) + 1, std::string());
-        for (const auto& kv : by_id) names[kv.first] = kv.second;
+        md.names.assign(static_cast<size_t>(by_id.rbegin()->first) + 1, std::string());
+        for (const auto& kv : by_id) md.names[kv.first] = kv.second;
     }
+    return md;
 }
 
 static std::string class_label(const std::vector<std::string>& names, int id) {
@@ -432,34 +460,59 @@ struct ModelInfo {
     std::string in_blob;
     std::string out_blob;
     int size = 640;
+    bool xyxy = false;     // output boxes are x1,y1,x2,y2 (else cx,cy,w,h)
+    bool topleft = false;  // letterbox image in the top-left corner (else centred)
 };
 
-// Decode a YOLOv8/v9-style head: (4 + num_classes) x num_anchors, rows are
-// cx, cy, w, h, then one (already sigmoid-activated) score per class, in
-// letterboxed input pixels. The transposed layout (anchors x features) is
-// detected automatically: there are always far more anchors than features.
-static bool decode_yolo(const ncnn::Mat& out_raw, float conf, float scale, int pad_l, int pad_t,
-                        const Region& r, std::vector<Detection>& dets) {
-    ncnn::Mat out = out_raw;
-    if (out.dims == 3 && out.c == 1) out = out.channel(0);
-    if (out.dims != 2) {
-        std::fprintf(stderr, "Unexpected output shape (dims=%d, w=%d, h=%d, c=%d); expected 2D (4+classes) x anchors\n",
-                     out.dims, out.w, out.h, out.c);
-        return false;
-    }
-    const bool feature_rows = out.h <= out.w;  // ncnn Mat for [1, 84, 8400] is h=84, w=8400
-    const int n_feat = feature_rows ? out.h : out.w;
-    const int n_anchor = feature_rows ? out.w : out.h;
-    const int n_cls = n_feat - 4;
-    if (n_cls < 1) {
-        std::fprintf(stderr, "Output has %d features per anchor; expected 4 box values + class scores\n", n_feat);
-        return false;
-    }
-    auto at = [&](int f, int a) -> float {
-        return feature_rows ? out.row(f)[a] : out.row(a)[f];
-    };
+// View the head output as (features x anchors). ncnn gives [4 + nc, N] as
+// h = 4 + nc, w = N; the transposed layout (anchors x features) is detected
+// automatically, since there are always far more anchors than features.
+struct HeadView {
+    ncnn::Mat out;
+    bool feature_rows = true;
+    int n_feat = 0, n_anchor = 0;
+    float at(int f, int a) const { return feature_rows ? out.row(f)[a] : out.row(a)[f]; }
+};
 
-    for (int a = 0; a < n_anchor; ++a) {
+static bool make_head_view(const ncnn::Mat& out_raw, HeadView& v) {
+    v.out = out_raw;
+    if (v.out.dims == 3 && v.out.c == 1) v.out = v.out.channel(0);
+    if (v.out.dims != 2) {
+        std::fprintf(stderr, "Unexpected output shape (dims=%d, w=%d, h=%d, c=%d); expected 2D (4+classes) x anchors\n",
+                     v.out.dims, v.out.w, v.out.h, v.out.c);
+        return false;
+    }
+    v.feature_rows = v.out.h <= v.out.w;
+    v.n_feat = v.feature_rows ? v.out.h : v.out.w;
+    v.n_anchor = v.feature_rows ? v.out.w : v.out.h;
+    if (v.n_feat < 5) {
+        std::fprintf(stderr, "Output has %d features per anchor; expected 4 box values + class scores\n", v.n_feat);
+        return false;
+    }
+    return true;
+}
+
+// Corner boxes always satisfy x2 >= x1 and y2 >= y1. With centre boxes, many
+// anchors have a centre further from the origin than the box is wide, so the
+// same test fails somewhere among the thousands of anchors.
+static bool looks_like_xyxy(const HeadView& v) {
+    for (int a = 0; a < v.n_anchor; ++a) {
+        if (v.at(2, a) < v.at(0, a) || v.at(3, a) < v.at(1, a)) return false;
+    }
+    return true;
+}
+
+// Decode a YOLOv9-style head: (4 + num_classes) x num_anchors. Rows are the
+// box (x1,y1,x2,y2 or cx,cy,w,h, in letterboxed input pixels), then one
+// sigmoid-activated score per class.
+static bool decode_yolo(const ncnn::Mat& out_raw, bool xyxy, float conf, float scale, int pad_l, int pad_t,
+                        const Region& r, std::vector<Detection>& dets) {
+    HeadView v;
+    if (!make_head_view(out_raw, v)) return false;
+    const int n_cls = v.n_feat - 4;
+    auto at = [&](int f, int a) { return v.at(f, a); };
+
+    for (int a = 0; a < v.n_anchor; ++a) {
         int best = 0;
         float best_score = at(4, a);
         for (int c = 1; c < n_cls; ++c) {
@@ -468,12 +521,18 @@ static bool decode_yolo(const ncnn::Mat& out_raw, float conf, float scale, int p
         }
         if (best_score < conf) continue;
 
-        const float cx = at(0, a), cy = at(1, a), w = at(2, a), h = at(3, a);
+        float bx1, by1, bx2, by2;
+        if (xyxy) {
+            bx1 = at(0, a); by1 = at(1, a); bx2 = at(2, a); by2 = at(3, a);
+        } else {
+            const float cx = at(0, a), cy = at(1, a), w = at(2, a), h = at(3, a);
+            bx1 = cx - 0.5f * w; by1 = cy - 0.5f * h; bx2 = cx + 0.5f * w; by2 = cy + 0.5f * h;
+        }
         // Undo the letterbox, clamp to the region, then shift to image coordinates
-        float x1 = std::clamp((cx - 0.5f * w - pad_l) / scale, 0.0f, static_cast<float>(r.width));
-        float y1 = std::clamp((cy - 0.5f * h - pad_t) / scale, 0.0f, static_cast<float>(r.height));
-        float x2 = std::clamp((cx + 0.5f * w - pad_l) / scale, 0.0f, static_cast<float>(r.width));
-        float y2 = std::clamp((cy + 0.5f * h - pad_t) / scale, 0.0f, static_cast<float>(r.height));
+        float x1 = std::clamp((bx1 - pad_l) / scale, 0.0f, static_cast<float>(r.width));
+        float y1 = std::clamp((by1 - pad_t) / scale, 0.0f, static_cast<float>(r.height));
+        float x2 = std::clamp((bx2 - pad_l) / scale, 0.0f, static_cast<float>(r.width));
+        float y2 = std::clamp((by2 - pad_t) / scale, 0.0f, static_cast<float>(r.height));
         if (x2 - x1 < 1.0f || y2 - y1 < 1.0f) continue;
 
         Detection d;
@@ -485,16 +544,17 @@ static bool decode_yolo(const ncnn::Mat& out_raw, float conf, float scale, int p
     return true;
 }
 
-// Letterbox one region of the image to size x size (gray 114 padding, centered),
+// Letterbox one region of the image to size x size (gray 114 padding, centred or top-left),
 // run YOLOv9 and return its detections (after per-region NMS) in image coordinates.
 // Uses its own Extractor, so it is safe to call concurrently on the same Net.
 static bool detect_region(const ncnn::Net& net, const ModelInfo& mi, const cv::Mat& bgr,
                           const Region& r, float conf, float nms_iou, std::vector<Detection>& out) {
     const int S = mi.size;
     const float scale = std::min(static_cast<float>(S) / r.width, static_cast<float>(S) / r.height);
-    const int nw = std::max(1, static_cast<int>(std::round(r.width * scale)));
-    const int nh = std::max(1, static_cast<int>(std::round(r.height * scale)));
-    const int pad_l = (S - nw) / 2, pad_t = (S - nh) / 2;
+    const int nw = std::min(S, std::max(1, static_cast<int>(r.width * scale)));
+    const int nh = std::min(S, std::max(1, static_cast<int>(r.height * scale)));
+    const int pad_l = mi.topleft ? 0 : (S - nw) / 2;
+    const int pad_t = mi.topleft ? 0 : (S - nh) / 2;
 
     // Read the region straight from the BGR image (row stride = full image row), convert to RGB
     const unsigned char* src = bgr.ptr<unsigned char>(r.y) + static_cast<size_t>(r.x) * 3;
@@ -518,7 +578,7 @@ static bool detect_region(const ncnn::Net& net, const ModelInfo& mi, const cv::M
     }
 
     std::vector<Detection> dets;
-    if (!decode_yolo(raw, conf, scale, pad_l, pad_t, r, dets)) return false;
+    if (!decode_yolo(raw, mi.xyxy, conf, scale, pad_l, pad_t, r, dets)) return false;
 
     // The head predicts many overlapping boxes per object: suppress within the region first
     std::vector<Detection> kept = apply_class_aware_nms(dets, conf, nms_iou);
@@ -610,12 +670,13 @@ int main(int argc, char** argv) {
     const fs::path param_path(opt.param), bin_path(opt.bin);
     if (!check_model_files(param_path, bin_path)) return 1;
 
-    // Class names and input size: --names / --size win; otherwise use the
-    // metadata.yaml Ultralytics writes next to the .param; otherwise defaults.
-    std::vector<std::string> class_names, meta_names;
-    int meta_imgsz = 0;
+    // Class names, input size, box format and letterbox placement: command-line
+    // options win; otherwise a metadata.yaml next to the .param; otherwise defaults.
+    std::vector<std::string> class_names;
     const fs::path meta_path = param_path.parent_path() / "metadata.yaml";
-    read_ultralytics_metadata(meta_path, meta_names, meta_imgsz);
+    const ModelMetadata md = read_model_metadata(meta_path);
+    const std::vector<std::string>& meta_names = md.names;
+    const int meta_imgsz = md.imgsz;
     std::string names_source;
     if (!opt.names_path.empty()) {
         if (!load_class_names(opt.names_path, class_names)) {
@@ -697,6 +758,14 @@ int main(int argc, char** argv) {
 
     ModelInfo mi;
     mi.size = opt.size;
+    std::string pad_source = "default";
+    if (opt.pad != "auto") {
+        mi.topleft = opt.pad == "topleft";
+        pad_source = "--pad";
+    } else if (md.letterbox_pad == "topleft" || md.letterbox_pad == "center" || md.letterbox_pad == "centre") {
+        mi.topleft = md.letterbox_pad == "topleft";
+        pad_source = "metadata.yaml";
+    }
     mi.in_blob = opt.in_blob;
     mi.out_blob = opt.out_blob;
     if (mi.in_blob.empty()) {
@@ -711,6 +780,8 @@ int main(int argc, char** argv) {
 
     // Check the blob names and output layout once, on a blank input, so a wrong
     // --in/--out or an unsupported model fails here instead of on every tile.
+    // The same output tells us the box format when nothing else does.
+    std::string box_source;
     {
         ncnn::Mat probe(mi.size, mi.size, 3);
         probe.fill(0.5f);
@@ -725,8 +796,18 @@ int main(int argc, char** argv) {
             std::cerr << "\nPass the right names with --in / --out.\n";
             return 1;
         }
-        std::vector<Detection> ignored;
-        if (!decode_yolo(out, 2.0f, 1.0f, 0, 0, Region{0, 0, mi.size, mi.size}, ignored)) return 1;
+        HeadView v;
+        if (!make_head_view(out, v)) return 1;
+        if (opt.box != "auto") {
+            mi.xyxy = opt.box == "xyxy";
+            box_source = "--box";
+        } else if (md.libreyolo && md.model_family.rfind("yolo9", 0) == 0) {
+            mi.xyxy = true;  // LibreYOLO's YOLOv9 head exports xyxy boxes
+            box_source = "metadata.yaml";
+        } else {
+            mi.xyxy = looks_like_xyxy(v);
+            box_source = "detected";
+        }
     }
 
 #ifdef _OPENMP
@@ -737,7 +818,9 @@ int main(int argc, char** argv) {
 
     const double init_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
     std::cout << "Model: " << param_path.string() << " + " << bin_path.filename().string() << " (" << mi.in_blob << " -> " << mi.out_blob
-              << ", input " << mi.size << "x" << mi.size << ") | " << device << " | "
+              << ", input " << mi.size << "x" << mi.size << ", boxes " << (mi.xyxy ? "xyxy" : "cxcywh")
+              << " (" << box_source << "), pad " << (mi.topleft ? "topleft" : "center") << " (" << pad_source
+              << ")) | " << device << " | "
               << workers << " worker(s) x " << threads_per_worker << " thread(s)"
 #ifndef _OPENMP
               << " [built without OpenMP: tiles run sequentially]"

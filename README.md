@@ -13,7 +13,7 @@ yolov9-sahi/
 ├── main.cpp
 ├── ncnn/                     # git submodule (Tencent/ncnn, release 20261020)
 └── models/
-    └── yolov9c_ncnn_model/   # not committed: model.ncnn.param, model.ncnn.bin, metadata.yaml
+    └── LibreYOLO9t_ncnn/     # not committed: model.ncnn.param, model.ncnn.bin, metadata.yaml
 ```
 
 ## Clone
@@ -26,30 +26,33 @@ git submodule update --init --recursive
 
 ## Model
 
-Export a YOLOv9 model to ncnn with [Ultralytics](https://docs.ultralytics.com/integrations/ncnn/)
-(any machine with Python; WSL is fine):
+The model comes from [LibreYOLO](https://github.com/LibreYOLO/libreyolo) (MIT license),
+exported to ncnn (any machine with Python; WSL is fine):
 
 ```bash
-pip install ultralytics
-yolo export model=yolov9c.pt format=ncnn imgsz=640     # or your own trained best.pt
-mv yolov9c_ncnn_model models/
+pip install "libreyolo[ncnn]"
+libreyolo export --model LibreYOLO9t.pt --format ncnn --imgsz 640   # or your own trained checkpoint
+mv weights/LibreYOLO9t_ncnn models/
 ```
 
 This writes `model.ncnn.param`, `model.ncnn.bin` and `metadata.yaml`. Pass the two model
-files; the class names and input size are read from the `metadata.yaml` next to the
-`.param` file:
+files; the `metadata.yaml` next to the `.param` file is read automatically for the class
+names, input size, box format and letterbox placement:
 
 ```bash
-./build/yolov9_sahi models/yolov9c_ncnn_model/model.ncnn.param models/yolov9c_ncnn_model/model.ncnn.bin images/
+./build/yolov9_sahi models/LibreYOLO9t_ncnn/model.ncnn.param models/LibreYOLO9t_ncnn/model.ncnn.bin images/
 ```
 
-Models converted another way work too, e.g. the YOLOv9-C model from
-[twlelev/Yolov9-Ncnn](https://github.com/twlelev/Yolov9-Ncnn) (ONNX → ncnn, blobs
-`images` → `output0`; names come from `--names`, and the blob names are picked up
-automatically). The requirement is the usual
-`(4 + classes) × anchors` tensor (box centre x/y, width, height in input pixels, then the
-sigmoid class scores). Pass `--in`/`--out` if the blob names aren't the first
-input/output.
+LibreYOLO's YOLOv9 (including the NMS-free E2E variant) outputs one `(4 + classes) × anchors`
+tensor: `x1, y1, x2, y2` in input pixels, then sigmoid class scores. LibreYOLO-trained
+checkpoints letterbox the image into the top-left corner; converted official checkpoints
+centre it; `metadata.yaml` records which (`letterbox_pad`).
+
+Without a `metadata.yaml`, the box format (`x1,y1,x2,y2` or centre/width/height) is
+detected from the model's output, the image is centred, and class names come from
+`--names`. This also covers other YOLOv9 ncnn conversions, e.g. the YOLOv9-C model from
+[twlelev/Yolov9-Ncnn](https://github.com/twlelev/Yolov9-Ncnn) (blobs `images` → `output0`,
+picked up automatically). `--box`, `--pad`, `--in` and `--out` override the detection.
 
 ## Build
 
@@ -107,9 +110,11 @@ yolov9_sahi <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]
 | `--merge` | `nmm` | merging across tiles: `nmm` merges overlapping boxes into one, `nms` keeps the best |
 | `--match` | `ios` | overlap metric for the merge: `ios` (intersection over smaller box) or `iou` |
 | `--match-thresh` | 0.5 | overlap above which boxes are merged |
+| `--box` | `metadata.yaml`, else detected | box format in the output: `xyxy` or `cxcywh` |
+| `--pad` | `metadata.yaml`, else `center` | letterbox placement: `center` or `topleft` |
 | `--in`, `--out` | model's first input/output (`in0`, `out0`) | ncnn blob names |
 
-Each tile is letterboxed (gray padding, centred) to the input size, normalized to 0–1 RGB
+Each tile is letterboxed (gray padding, centred or top-left) to the input size, normalized to 0–1 RGB
 and run through the network; boxes are decoded (best class per anchor), mapped back to
 the image and de-duplicated within the tile with class-aware NMS.
 
