@@ -69,6 +69,15 @@ there, or build natively on Windows/Linux for `--gpu`.
 
 ## Run
 
+The model is a `.param` + `.bin` pair. Pass the `.param` file (the `.bin` with the same
+name next to it is used), both files, or an Ultralytics export folder:
+
+```bash
+./build/yolov9_sahi models/yolov9.param image.jpg                       # uses models/yolov9.bin
+./build/yolov9_sahi models/yolov9.param models/weights.bin image.jpg    # .bin named differently
+./build/yolov9_sahi models/yolov9c_ncnn_model image.jpg                 # Ultralytics export folder
+```
+
 ```bash
 # one image
 ./build/yolov9_sahi models/yolov9c_ncnn_model image.jpg -o result.jpg
@@ -79,6 +88,7 @@ there, or build natively on Windows/Linux for `--gpu`.
 
 | Option | Default | Meaning |
 |---|---|---|
+| `-b, --bin` | `.param` name with `.bin` | model weights, if not named like the `.param` (or give it as the 2nd argument) |
 | `-o, --output` | `sahi_output.jpg` / `sahi_output/` | output file for one image, output directory for several (`<name>_sahi.<ext>`) |
 | `--csv` | off | write all detections: `image,class_id,class_name,score,x1,y1,x2,y2` |
 | `-n, --names` | `metadata.yaml` | text file of class names, one per line: line 1 = class 0, line 2 = class 1, ... |

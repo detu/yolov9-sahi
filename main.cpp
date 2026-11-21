@@ -45,6 +45,7 @@ struct Region {
 
 struct Options {
     std::string model;                // .param file or a directory containing one
+    std::string bin;                  // .bin file (default: next to the .param, same name)
     std::vector<std::string> inputs;  // image files and/or directories
     std::string output;               // -o: output file (single image) or directory
     std::string csv_path;             // --csv: optional detections CSV
@@ -79,12 +80,14 @@ static int hardware_threads() {
 
 static void print_usage(const char* prog) {
     std::cerr
-        << "Usage: " << prog << " <model.param|model_dir> <image|dir> [<image|dir> ...] [options]\n"
+        << "Usage: " << prog << " <model.param> [model.bin] <image|dir> [<image|dir> ...] [options]\n"
+        << "       " << prog << " <model_dir> <image|dir> [<image|dir> ...] [options]\n"
         << "\n"
-        << "Loads the YOLOv9 ncnn model once and runs SAHI on every image given. The .bin\n"
-        << "file is expected next to the .param file with the same name. Directories are\n"
-        << "scanned for .jpg/.jpeg/.png/.bmp/.tif/.tiff/.webp files (sorted by name).\n"
+        << "Loads the YOLOv9 ncnn model (.param + .bin) once and runs SAHI on every image given.\n"
+        << "If the .bin is not given, it is taken from next to the .param with the same name.\n"
+        << "Directories are scanned for .jpg/.jpeg/.png/.bmp/.tif/.tiff/.webp files (sorted by name).\n"
         << "\n"
+        << "  -b, --bin <file>       model weights (.bin), if not named like the .param\n"
         << "  -o, --output <path>    single image: output file (default: sahi_output.jpg)\n"
         << "                         several images: output directory (default: sahi_output/)\n"
         << "                         files are written as <name>_sahi.<ext>\n"
@@ -124,6 +127,7 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         const char* v = nullptr;
         if (a == "-h" || a == "--help") return false;
         else if (a == "-o" || a == "--output")    { if (!(v = next("--output")))  return false; opt.output = v; }
+        else if (a == "-b" || a == "--bin")       { if (!(v = next("--bin")))     return false; opt.bin = v; }
         else if (a == "--csv")                    { if (!(v = next("--csv")))     return false; opt.csv_path = v; }
         else if (a == "-n" || a == "--names")     { if (!(v = next("--names")))   return false; opt.names_path = v; }
         else if (a == "-r" || a == "--recursive") { opt.recursive = true; }
@@ -159,13 +163,22 @@ static bool parse_args(int argc, char** argv, Options& opt) {
     if (opt.merge != "nmm" && opt.merge != "nms") { std::cerr << "--merge must be nmm or nms\n"; return false; }
     if (opt.match != "ios" && opt.match != "iou") { std::cerr << "--match must be ios or iou\n"; return false; }
     opt.model = positional[0];
-    opt.inputs.assign(positional.begin() + 1, positional.end());
+    size_t first_input = 1;
+    // Optional second positional: the .bin file
+    const std::string& p1 = positional[1];
+    if (p1.size() > 4 && p1.compare(p1.size() - 4, 4, ".bin") == 0) {
+        if (!opt.bin.empty()) { std::cerr << "Weights given twice (" << opt.bin << " and " << p1 << ")\n"; return false; }
+        opt.bin = p1;
+        first_input = 2;
+    }
+    if (positional.size() <= first_input) return false;
+    opt.inputs.assign(positional.begin() + first_input, positional.end());
     return true;
 }
 
 // Accept a .param file, or a directory (e.g. Ultralytics' yolov9c_ncnn_model/)
 // containing model.ncnn.param or a single *.param file.
-static bool resolve_model_files(const std::string& model, fs::path& param, fs::path& bin) {
+static bool resolve_model_files(const std::string& model, const std::string& bin_arg, fs::path& param, fs::path& bin) {
     std::error_code ec;
     fs::path p(model);
     if (fs::is_directory(p, ec)) {
@@ -186,10 +199,18 @@ static bool resolve_model_files(const std::string& model, fs::path& param, fs::p
     } else {
         param = p;
     }
-    bin = param;
-    bin.replace_extension(".bin");
+    if (!bin_arg.empty()) {
+        bin = bin_arg;
+    } else {
+        bin = param;
+        bin.replace_extension(".bin");
+    }
     if (!fs::exists(param, ec)) { std::cerr << "Model file not found: " << param << "\n"; return false; }
-    if (!fs::exists(bin, ec))   { std::cerr << "Weights file not found: " << bin << "\n"; return false; }
+    if (!fs::exists(bin, ec)) {
+        std::cerr << "Weights file not found: " << bin
+                  << (bin_arg.empty() ? " (pass the .bin as the second argument or with --bin)" : "") << "\n";
+        return false;
+    }
     return true;
 }
 
@@ -613,7 +634,7 @@ int main(int argc, char** argv) {
     const auto t0 = clock::now();
 
     fs::path param_path, bin_path;
-    if (!resolve_model_files(opt.model, param_path, bin_path)) return 1;
+    if (!resolve_model_files(opt.model, opt.bin, param_path, bin_path)) return 1;
 
     // Class names and input size: --names / --size win; otherwise use the
     // metadata.yaml Ultralytics writes next to the model; otherwise defaults.
@@ -741,7 +762,7 @@ int main(int argc, char** argv) {
 #endif
 
     const double init_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-    std::cout << "Model: " << param_path.string() << " (" << mi.in_blob << " -> " << mi.out_blob
+    std::cout << "Model: " << param_path.string() << " + " << bin_path.filename().string() << " (" << mi.in_blob << " -> " << mi.out_blob
               << ", input " << mi.size << "x" << mi.size << ") | " << device << " | "
               << workers << " worker(s) x " << threads_per_worker << " thread(s)"
 #ifndef _OPENMP
