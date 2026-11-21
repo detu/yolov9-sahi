@@ -88,6 +88,22 @@ else()
                 set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
             endif()
         endif()
+        # nvcc is often not on PATH (e.g. WSL2 without /usr/local/cuda/bin in PATH):
+        # look in the standard install locations before giving up.
+        if(NOT CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
+            file(GLOB _cuda_dirs LIST_DIRECTORIES true "/usr/local/cuda-*")
+            list(SORT _cuda_dirs COMPARE NATURAL ORDER DESCENDING)  # newest versioned install first
+            find_program(SAHI_NVCC nvcc
+                         HINTS "$ENV{CUDA_HOME}/bin" "$ENV{CUDA_PATH}/bin" /usr/local/cuda/bin
+                         PATHS ${_cuda_dirs} PATH_SUFFIXES bin)
+            if(SAHI_NVCC)
+                set(CMAKE_CUDA_COMPILER "${SAHI_NVCC}")
+                message(STATUS "yolov9_sahi: using nvcc ${SAHI_NVCC}")
+            else()
+                message(FATAL_ERROR "nvcc not found. Install the CUDA toolkit (cuda-toolkit) and either add its "
+                                    "bin/ to PATH or pass -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc")
+            endif()
+        endif()
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 17)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)

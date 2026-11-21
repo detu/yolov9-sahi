@@ -101,8 +101,9 @@ IoBinding).
    ```
 
    nvcc compiles the kernels for the GPU in the machine (CMake ≥ 3.24); otherwise pass
-   e.g. `-DCMAKE_CUDA_ARCHITECTURES=89`. If CMake can't find nvcc, add
-   `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc`. The program finds
+   e.g. `-DCMAKE_CUDA_ARCHITECTURES=89`. nvcc is found on PATH, in `$CUDA_HOME/bin`, or in
+   `/usr/local/cuda*/bin` (newest version first); otherwise pass
+   `-DCMAKE_CUDA_COMPILER=/path/to/nvcc`. The program finds
    `libonnxruntime*.so` in the package directory by itself (RPATH).
 
 ```bash
