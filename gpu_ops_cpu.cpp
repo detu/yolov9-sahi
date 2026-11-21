@@ -43,7 +43,7 @@ bool set_image(Context* ctx, const uint8_t* bgr, int, int, size_t step, std::str
     return true;
 }
 
-bool preprocess(Context* ctx, const int* xy, int n, std::string& error) {
+bool preprocess(Context* ctx, const RegionXform* regions, int n, std::string& error) {
     if (n <= 0 || n > ctx->max_batch) {
         error = "preprocess: bad batch size";
         return false;
@@ -56,7 +56,7 @@ bool preprocess(Context* ctx, const int* xy, int n, std::string& error) {
             for (int y = 0; y < S; ++y)
                 for (int x = 0; x < S; ++x)
                     dst[c * plane + static_cast<size_t>(y) * S + x] =
-                        tile_input_value(ctx->image, ctx->image_step, xy[2 * b], xy[2 * b + 1], c, y, x);
+                        letterbox_input_value(ctx->image, ctx->image_step, regions[b], c, y, x);
     }
     return true;
 }

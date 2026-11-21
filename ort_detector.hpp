@@ -15,6 +15,7 @@ struct OrtConfig {
     int device = 0;          // CUDA device
     int threads = 0;         // CPU build: intra-op threads (0 = ONNX Runtime default)
     std::string box = "auto";
+    std::string pad = "auto";  // letterbox placement: auto (metadata, else center), center, topleft
     std::string in_name, out_name;
 };
 
@@ -26,6 +27,8 @@ struct OrtModelInfo {
     bool dynamic_batch = false;
     bool xyxy = false;
     std::string box_source;            // "--box", "metadata", "detected"
+    bool topleft = false;              // letterbox at the top-left (LibreYOLO checkpoints), else centred
+    std::string pad_source;            // "--pad", "metadata", "default"
     std::vector<std::string> names;    // from the model's metadata, if any
     std::string family;                // LibreYOLO model_family, if any
 };

@@ -1,11 +1,10 @@
-// YOLOv9 tiled inference with ncnn.
+// YOLOv9 + SAHI (Slicing Aided Hyper Inference).
 //
-// The image is cut into model-sized tiles on a grid with 50% overlap (stride =
-// half a tile by default); the last tile in each row/column is clamped to the
-// image border. Every tile runs through YOLOv9 at native resolution.
-// Detections touching an interior tile edge are dropped, because the
-// neighbouring tile sees those objects whole; the rest are mapped back to the
-// image and merged with one class-aware NMS.
+// The image is cut into overlapping slices at the model's input size (and,
+// with --full, the whole image is added as one more region). Every region is
+// letterboxed and run through YOLOv9 (ONNX Runtime with CUDA, or ncnn),
+// detections are mapped back to the image, and duplicates and fragments across
+// slice borders are merged as in the SAHI library (greedy NMM with IOS).
 
 #include <algorithm>
 #include <cctype>
@@ -66,15 +65,18 @@ struct Options {
     std::string pad = "auto";         // letterbox placement: auto, center or topleft
     bool recursive = false;
     bool gpu = false;                 // Vulkan, if ncnn was built with it
-    int size = 0;                     // model input size = tile size (0 = metadata.yaml or 640)
-    int stride = 0;                   // tile stride (0 = half a tile, i.e. 50% overlap)
-    int margin = 8;                   // drop detections within this many px of an interior tile edge
-    float pre_scale = 1.0f;           // downscale the image before tiling (fewer tiles)
+    bool full = false;                // also run on the whole (letterboxed) image
+    int size = 0;                     // model input size (0 = model metadata or 640)
+    int slice = 0;                    // slice size (0 = model input size)
     int workers = 0;                  // parallel tile workers (0 = auto: one per core, up to the tile count)
     int threads_per_worker = 0;       // ncnn threads per worker (0 = auto: cores / workers)
     int cores = 0;                    // thread budget (0 = physical cores)
+    float overlap = 0.20f;
     float conf = 0.25f;
     float nms_iou = 0.45f;
+    std::string merge = "nmm";        // final cross-slice merge: nmm (greedy merging) or nms
+    std::string match = "ios";        // overlap metric for the final merge: ios or iou
+    float match_thresh = 0.5f;
 };
 
 // ---------------------------------------------------------------------------
@@ -98,13 +100,12 @@ static void print_usage(const char* prog) {
 #if SAHI_NCNN
         << "Usage: " << prog << " <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]\n"
         << "\n"
-        << "Loads the YOLOv9 ncnn model (.param, then .bin) once and runs tiled detection on every\n"
-        << "image given.\n"
+        << "Loads the YOLOv9 ncnn model (.param, then .bin) once and runs SAHI on every image given.\n"
 #else
         << "Usage: " << prog << " <model.onnx> <image|dir> [<image|dir> ...] [options]\n"
         << "\n"
-        << "Loads the YOLOv9 ONNX model once (ONNX Runtime, " SAHI_ORT_DEVICE ") and runs tiled detection\n"
-        << "on every image given.\n"
+        << "Loads the YOLOv9 ONNX model once (ONNX Runtime, " SAHI_ORT_DEVICE ") and runs SAHI on every\n"
+        << "image given.\n"
 #endif
         << "Directories are scanned for .jpg/.jpeg/.png/.bmp/.tif/.tiff/.webp files (sorted by name).\n"
         << "\n"
@@ -119,17 +120,17 @@ static void print_usage(const char* prog) {
         << "                         (default: names stored in the ONNX model, if present)\n"
 #endif
         << "  -r, --recursive        scan directories recursively\n"
-        << "  -s, --size <n>         model input size = tile size (default: from the model's metadata, else 640)\n"
-        << "      --stride <n>       tile stride in pixels (default: half a tile, i.e. 50% overlap)\n"
-        << "      --margin <n>       drop detections within n px of an interior tile edge (default: 8)\n"
-        << "      --pre-scale <f>    downscale the image by f (0 < f <= 1) before tiling (default: 1)\n"
+        << "  -s, --size <n>         model input size (default: from the model's metadata, else 640)\n"
+        << "      --slice <n>        slice size (default: model input size)\n"
+        << "      --overlap <r>      slice overlap ratio (default: 0.20)\n"
+        << "      --full             also detect on the whole image (finds large objects)\n"
 #if SAHI_NCNN
-        << "  -w, --workers <n>      tiles run in parallel (default: one per core, never more than tiles)\n"
-        << "  -t, --threads <n>      ncnn threads per tile (default: cores / workers)\n"
+        << "  -w, --workers <n>      slices run in parallel (default: one per core, never more than slices)\n"
+        << "  -t, --threads <n>      ncnn threads per slice (default: cores / workers)\n"
         << "  -j, --cores <n>        total thread budget (default: physical CPU cores)\n"
         << "      --gpu              use Vulkan (needs a build with -DSAHI_VULKAN=ON)\n"
 #else
-        << "  -b, --batch <n>        tiles per inference run, for models exported with a dynamic\n"
+        << "  -b, --batch <n>        slices per inference run, for models exported with a dynamic\n"
         << "                         batch size (default: 8; fixed-batch models use their batch)\n"
 #if SAHI_ORT_CUDA
         << "      --device <n>       CUDA device index (default: 0)\n"
@@ -138,13 +139,16 @@ static void print_usage(const char* prog) {
 #endif
 #endif
         << "      --conf <c>         confidence threshold (default: 0.25)\n"
-        << "      --iou <i>          NMS IoU threshold, per tile and for the final merge (default: 0.45)\n"
+        << "      --iou <i>          NMS IoU threshold within a slice (default: 0.45)\n"
+        << "      --merge <m>        merging across slices: nmm = merge overlapping boxes into one (default),\n"
+        << "                         nms = keep only the best box\n"
+        << "      --match <m>        overlap metric for the merge: ios = intersection over the smaller box\n"
+        << "                         (default; joins objects cut by a slice edge), iou = intersection over union\n"
+        << "      --match-thresh <t> overlap above which boxes are merged (default: 0.5)\n"
         << "      --box <fmt>        box format in the model output: xyxy (LibreYOLO) or cxcywh\n"
         << "                         (default: from the model's metadata, else detected from the output)\n"
-#if SAHI_NCNN
         << "      --pad <mode>       letterbox placement: center or topleft (LibreYOLO checkpoints)\n"
-        << "                         (default: letterbox_pad from metadata.yaml, else center)\n"
-#endif
+        << "                         (default: letterbox_pad from the model's metadata, else center)\n"
         << "      --in <name>        input name (default: the model's first input)\n"
         << "      --out <name>       output name (default: the model's first output)\n";
 }
@@ -167,9 +171,12 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "-n" || a == "--names")     { if (!(v = next("--names")))   return false; opt.names_path = v; }
         else if (a == "-r" || a == "--recursive") { opt.recursive = true; }
         else if (a == "-s" || a == "--size")      { if (!(v = next("--size")))    return false; opt.size = std::atoi(v); }
-        else if (a == "--stride")                 { if (!(v = next("--stride")))  return false; opt.stride = std::atoi(v); }
-        else if (a == "--margin")                 { if (!(v = next("--margin")))  return false; opt.margin = std::atoi(v); }
-        else if (a == "--pre-scale")              { if (!(v = next("--pre-scale"))) return false; opt.pre_scale = std::strtof(v, nullptr); }
+        else if (a == "--slice")                  { if (!(v = next("--slice")))   return false; opt.slice = std::atoi(v); }
+        else if (a == "--overlap")                { if (!(v = next("--overlap"))) return false; opt.overlap = std::strtof(v, nullptr); }
+        else if (a == "--full")                   { opt.full = true; }
+        else if (a == "--merge")                  { if (!(v = next("--merge")))   return false; opt.merge = v; }
+        else if (a == "--match")                  { if (!(v = next("--match")))   return false; opt.match = v; }
+        else if (a == "--match-thresh")           { if (!(v = next("--match-thresh"))) return false; opt.match_thresh = std::strtof(v, nullptr); }
         else if (a == "-w" || a == "--workers")   { if (!(v = next("--workers"))) return false; opt.workers = std::atoi(v); }
         else if (a == "-t" || a == "--threads")   { if (!(v = next("--threads"))) return false; opt.threads_per_worker = std::atoi(v); }
         else if (a == "-j" || a == "--cores")     { if (!(v = next("--cores")))   return false; opt.cores = std::atoi(v); }
@@ -189,9 +196,10 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         std::cerr << "--size must be at least 32\n";
         return false;
     }
-    if (opt.stride < 0) { std::cerr << "--stride must be positive\n"; return false; }
-    if (opt.margin < 0) { std::cerr << "--margin must be 0 or more\n"; return false; }
-    if (!(opt.pre_scale > 0.0f && opt.pre_scale <= 1.0f)) { std::cerr << "--pre-scale must be in (0, 1]\n"; return false; }
+    if (opt.slice < 0) { std::cerr << "--slice must be positive\n"; return false; }
+    if (opt.overlap < 0.0f || opt.overlap >= 1.0f) { std::cerr << "--overlap must be in [0, 1)\n"; return false; }
+    if (opt.merge != "nmm" && opt.merge != "nms") { std::cerr << "--merge must be nmm or nms\n"; return false; }
+    if (opt.match != "ios" && opt.match != "iou") { std::cerr << "--match must be ios or iou\n"; return false; }
     if (opt.box != "auto" && opt.box != "xyxy" && opt.box != "cxcywh") { std::cerr << "--box must be xyxy or cxcywh\n"; return false; }
     if (opt.pad != "auto" && opt.pad != "center" && opt.pad != "topleft") { std::cerr << "--pad must be center or topleft\n"; return false; }
     if (opt.batch < 1) { std::cerr << "--batch must be at least 1\n"; return false; }
@@ -380,32 +388,92 @@ static std::string csv_escape(const std::string& s) {
 }
 
 // ---------------------------------------------------------------------------
-// Tiling
+// SAHI
 // ---------------------------------------------------------------------------
 
-// Number of tile positions along one axis so that the last tile ends exactly
-// at the image border, without duplicate tiles.
-static int tile_count(int length, int size, int stride) {
-    if (length <= size) return 1;
-    return (length - size + stride - 1) / stride + 1;
+// Generate overlapping SAHI tile coordinates
+static std::vector<Region> generate_slices(int img_w, int img_h, int slice_w, int slice_h, float overlap_ratio) {
+    std::vector<Region> slices;
+    int step_x = std::max(1, static_cast<int>(slice_w * (1.0f - overlap_ratio)));
+    int step_y = std::max(1, static_cast<int>(slice_h * (1.0f - overlap_ratio)));
+
+    for (int y = 0; y < img_h; y += step_y) {
+        int h = std::min(slice_h, img_h - y);
+        // Shift window back if we hit the bottom edge so slice keeps full native resolution
+        int start_y = (h < slice_h && img_h >= slice_h) ? (img_h - slice_h) : y;
+        h = std::min(slice_h, img_h - start_y);
+
+        for (int x = 0; x < img_w; x += step_x) {
+            int w = std::min(slice_w, img_w - x);
+            // Shift window back if we hit the right edge
+            int start_x = (w < slice_w && img_w >= slice_w) ? (img_w - slice_w) : x;
+            w = std::min(slice_w, img_w - start_x);
+
+            slices.push_back({start_x, start_y, w, h});
+
+            if (start_x + w >= img_w) break;
+        }
+        if (start_y + h >= img_h) break;
+    }
+    return slices;
 }
 
-// Tile grid over an image of at least size x size pixels: a row/column every
-// `stride` pixels, the last one clamped to the border. Only coordinates are
-// produced; tiles are read in place from the image.
-static std::vector<Region> tile_grid(int img_w, int img_h, int size, int stride) {
-    std::vector<Region> tiles;
-    const int nx = tile_count(img_w, size, stride);
-    const int ny = tile_count(img_h, size, stride);
-    tiles.reserve(static_cast<size_t>(nx) * ny);
-    for (int r = 0; r < ny; ++r) {
-        for (int c = 0; c < nx; ++c) {
-            const int x = std::max(0, std::min(c * stride, img_w - size));
-            const int y = std::max(0, std::min(r * stride, img_h - size));
-            tiles.push_back({x, y, std::min(size, img_w), std::min(size, img_h)});
+// Final cross-tile merge, as in the SAHI library (GREEDYNMM / NMS with an IOS
+// or IOU match metric). Objects cut by a tile edge show up as a full box from
+// one tile plus a fragment from the neighbour; a fragment lies mostly inside
+// the full box, so intersection-over-smaller-area (IOS) catches it where IoU
+// does not. With NMM, matched boxes are merged into their union (two halves
+// of one object become one box) and keep the best score; with NMS they are
+// dropped. Per class, highest score first; classes run in parallel; output
+// order is deterministic.
+static std::vector<Detection> merge_detections(const std::vector<Detection>& dets, const Options& opt) {
+    const bool use_ios = opt.match == "ios";
+    const bool merge_boxes = opt.merge == "nmm";
+    auto overlap = [&](const cv::Rect2f& a, const cv::Rect2f& b) {
+        const float ix = std::min(a.x + a.width, b.x + b.width) - std::max(a.x, b.x);
+        const float iy = std::min(a.y + a.height, b.y + b.height) - std::max(a.y, b.y);
+        if (ix <= 0.0f || iy <= 0.0f) return 0.0f;
+        const float inter = ix * iy, area_a = a.width * a.height, area_b = b.width * b.height;
+        const float denom = use_ios ? std::min(area_a, area_b) : (area_a + area_b - inter);
+        return denom > 0.0f ? inter / denom : 0.0f;
+    };
+
+    std::map<int, std::vector<size_t>> by_class;
+    for (size_t i = 0; i < dets.size(); ++i) by_class[dets[i].class_id].push_back(i);
+    std::vector<std::vector<size_t>> groups;
+    for (auto& kv : by_class) groups.push_back(std::move(kv.second));
+    std::vector<std::vector<Detection>> kept(groups.size());
+
+    // Worth threads only when there are many boxes; usually this takes microseconds.
+    #pragma omp parallel for schedule(dynamic, 1) if (groups.size() > 1 && dets.size() > 4000)
+    for (int g = 0; g < static_cast<int>(groups.size()); ++g) {
+        std::vector<size_t> order = groups[g];
+        std::stable_sort(order.begin(), order.end(),
+                         [&](size_t a, size_t b) { return dets[a].confidence > dets[b].confidence; });
+        std::vector<char> used(order.size(), 0);
+        for (size_t i = 0; i < order.size(); ++i) {
+            if (used[i]) continue;
+            Detection keep = dets[order[i]];
+            const cv::Rect2f ref = keep.box;  // match against the original box, as SAHI does
+            float x1 = ref.x, y1 = ref.y, x2 = ref.x + ref.width, y2 = ref.y + ref.height;
+            for (size_t j = i + 1; j < order.size(); ++j) {
+                if (used[j]) continue;
+                const cv::Rect2f& b = dets[order[j]].box;
+                if (overlap(ref, b) <= opt.match_thresh) continue;
+                used[j] = 1;
+                if (merge_boxes) {
+                    x1 = std::min(x1, b.x); y1 = std::min(y1, b.y);
+                    x2 = std::max(x2, b.x + b.width); y2 = std::max(y2, b.y + b.height);
+                }
+            }
+            keep.box = cv::Rect2f(x1, y1, x2 - x1, y2 - y1);
+            kept[g].push_back(keep);
         }
     }
-    return tiles;
+
+    std::vector<Detection> out;
+    for (auto& v : kept) out.insert(out.end(), v.begin(), v.end());
+    return out;
 }
 
 #if SAHI_NCNN
@@ -662,71 +730,30 @@ private:
 #endif  // SAHI_NCNN
 
 // ---------------------------------------------------------------------------
-// Tiled detection (shared by the backends)
+// SAHI detection (shared by the backends)
 // ---------------------------------------------------------------------------
 
-// The image the tiles are cut from: optionally downscaled (fewer tiles), and
-// padded bottom/right with gray to at least one tile, so small images still
-// give a valid full-size tile. Padding at bottom/right keeps coordinates
-// unchanged. `inv_scale` maps work-image coordinates back to the original.
-static cv::Mat make_work_image(const cv::Mat& bgr, int size, float pre_scale, float& inv_scale) {
-    cv::Mat work = bgr;
-    inv_scale = 1.0f;
-    if (pre_scale > 0.0f && pre_scale < 1.0f) {
-        cv::resize(bgr, work, cv::Size(), pre_scale, pre_scale, cv::INTER_AREA);
-        inv_scale = static_cast<float>(bgr.cols) / work.cols;  // exact for the rounded size
+// SAHI regions of one image: overlapping slices, plus the whole image with
+// --full (skipped when one slice already covers everything).
+static std::vector<Region> sahi_regions(int img_w, int img_h, int slice_size, const Options& opt) {
+    std::vector<Region> regions = generate_slices(img_w, img_h, slice_size, slice_size, opt.overlap);
+    if (opt.full && !(regions.size() == 1 && regions[0].width == img_w && regions[0].height == img_h)) {
+        regions.push_back({0, 0, img_w, img_h});
     }
-    if (work.cols < size || work.rows < size) {
-        cv::Mat padded;
-        cv::copyMakeBorder(work, padded, 0, std::max(0, size - work.rows), 0, std::max(0, size - work.cols),
-                           cv::BORDER_CONSTANT, cv::Scalar(114, 114, 114));
-        work = padded;
-    }
-    return work;
+    return regions;
 }
 
-// Detect on all tiles of one image and merge. Results are concatenated in
-// tile order, so the output does not depend on thread scheduling.
-static std::vector<Detection> run_tiled(TileDetector& det, const cv::Mat& work, const std::vector<Region>& tiles,
-                                        float inv_scale, int img_w, int img_h, const Options& opt, size_t& n_raw,
-                                        int& failed) {
-    std::vector<std::vector<Detection>> per_tile;
-    failed = det.detect(work, tiles, opt.conf, opt.nms_iou, per_tile);
-
-    // Drop objects touching an *interior* tile edge: with 50% overlap the
-    // neighbouring tile sees them whole. Objects on a real image edge are kept.
-    // Then back to original-image coordinates (undo the pre-scale), clipped to
-    // the real image, i.e. without the gray padding.
-    const float margin = static_cast<float>(opt.margin);
-    const float max_x = static_cast<float>(img_w), max_y = static_cast<float>(img_h);
+// Detect on all regions of one image and merge. Results are concatenated in
+// region order, so the output does not depend on thread scheduling.
+static std::vector<Detection> run_sahi(TileDetector& det, const cv::Mat& bgr, const std::vector<Region>& regions,
+                                       const Options& opt, size_t& n_raw, int& failed) {
+    std::vector<std::vector<Detection>> per_region;
+    failed = det.detect(bgr, regions, opt.conf, opt.nms_iou, per_region);
     std::vector<Detection> all;
-    for (size_t i = 0; i < tiles.size(); ++i) {
-        const Region& r = tiles[i];
-        const bool left_interior = r.x > 0;
-        const bool top_interior = r.y > 0;
-        const bool right_interior = r.x + r.width < work.cols;
-        const bool bottom_interior = r.y + r.height < work.rows;
-        for (Detection d : per_tile[i]) {
-            const float lx0 = d.box.x - r.x, ly0 = d.box.y - r.y;  // tile-local
-            const float lx1 = lx0 + d.box.width, ly1 = ly0 + d.box.height;
-            if (left_interior && lx0 <= margin) continue;
-            if (top_interior && ly0 <= margin) continue;
-            if (right_interior && lx1 >= r.width - margin) continue;
-            if (bottom_interior && ly1 >= r.height - margin) continue;
-
-            const float x0 = std::min(d.box.x * inv_scale, max_x);
-            const float y0 = std::min(d.box.y * inv_scale, max_y);
-            const float x1 = std::min((d.box.x + d.box.width) * inv_scale, max_x);
-            const float y1 = std::min((d.box.y + d.box.height) * inv_scale, max_y);
-            if (x1 - x0 < 1.0f || y1 - y0 < 1.0f) continue;
-            d.box = cv::Rect2f(x0, y0, x1 - x0, y1 - y0);
-            all.push_back(d);
-        }
-    }
+    for (auto& v : per_region) all.insert(all.end(), v.begin(), v.end());
     n_raw = all.size();
-
-    // Duplicates of objects seen whole by two overlapping tiles
-    return apply_class_aware_nms(all, opt.conf, opt.nms_iou);
+    // Merge duplicates and fragments across slice borders
+    return merge_detections(all, opt);
 }
 
 // Draw boxes with "<class name> <score>" labels on a green background
@@ -836,6 +863,7 @@ int main(int argc, char** argv) {
         cfg.device = opt.device;
         cfg.threads = cores;
         cfg.box = opt.box;
+        cfg.pad = opt.pad;
         cfg.in_name = opt.in_blob;
         cfg.out_name = opt.out_blob;
         std::error_code ec;
@@ -857,7 +885,8 @@ int main(int argc, char** argv) {
         }
         model_line = "Model: " + cfg.model_path + " (" + info.in_name + " -> " + info.out_name + ", input " +
                      std::to_string(info.size) + "x" + std::to_string(info.size) + ", boxes " +
-                     (info.xyxy ? "xyxy" : "cxcywh") + " (" + info.box_source + ")) | " + info.device +
+                     (info.xyxy ? "xyxy" : "cxcywh") + " (" + info.box_source + "), pad " +
+                     (info.topleft ? "topleft" : "center") + " (" + info.pad_source + ")) | " + info.device +
                      " | batch " + std::to_string(info.batch) + (info.dynamic_batch ? "" : " (fixed by the model)");
     }
 #else
@@ -993,12 +1022,12 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    const int stride = opt.stride > 0 ? opt.stride : std::max(1, tile_size / 2);
+    const int slice_size = opt.slice > 0 ? opt.slice : tile_size;
     const double init_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
     std::cout << model_line << "\n"
-              << "Tiles: " << tile_size << "x" << tile_size << ", stride " << stride << ", edge margin " << opt.margin
-              << (opt.pre_scale < 1.0f ? ", pre-scale " + std::to_string(opt.pre_scale).substr(0, 4) : std::string())
-              << " | " << images.size() << " image(s)";
+              << "Slices: " << slice_size << "x" << slice_size << ", overlap " << opt.overlap
+              << (opt.full ? " + full image" : "") << " | merge " << opt.merge << "/" << opt.match << " > "
+              << opt.match_thresh << " | " << images.size() << " image(s)";
     if (!names_source.empty()) std::cout << " | " << class_names.size() << " class names from " << names_source;
     std::cout << " | init " << static_cast<int>(init_ms) << " ms\n";
 
@@ -1034,16 +1063,11 @@ int main(int argc, char** argv) {
 
         size_t n_raw = 0;
         int failed = 0;
-        float inv_scale = 1.0f;
-        const auto tp = clock::now();
-        const cv::Mat work = make_work_image(bgr, tile_size, opt.pre_scale, inv_scale);
-        const std::vector<Region> tiles = tile_grid(work.cols, work.rows, tile_size, stride);
-        const auto prep_time = clock::now() - tp;
+        const std::vector<Region> tiles = sahi_regions(bgr.cols, bgr.rows, slice_size, opt);
         detector->prepare(tiles.size());  // may load something on first use: not timed
         const auto ti = clock::now();
-        std::vector<Detection> merged = run_tiled(*detector, work, tiles, inv_scale, bgr.cols, bgr.rows, opt,
-                                                  n_raw, failed);
-        const double infer_ms = std::chrono::duration<double, std::milli>(clock::now() - ti + prep_time).count();
+        std::vector<Detection> merged = run_sahi(*detector, bgr, tiles, opt, n_raw, failed);
+        const double infer_ms = std::chrono::duration<double, std::milli>(clock::now() - ti).count();
 
         if (!class_names.empty()) {
             for (const auto& d : merged) {
@@ -1076,9 +1100,9 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::printf("%zu tiles (%s), %zu raw -> %zu dets, %.1f ms%s\n", tiles.size(),
+        std::printf("%zu regions (%s), %zu raw -> %zu dets, %.1f ms%s\n", tiles.size(),
                     detector->last_run_desc().c_str(), n_raw, merged.size(), infer_ms,
-                    failed ? (" | " + std::to_string(failed) + " tile(s) failed").c_str() : "");
+                    failed ? (" | " + std::to_string(failed) + " region(s) failed").c_str() : "");
         std::fflush(stdout);
 
         if (failed == static_cast<int>(tiles.size())) ++failed_images; else ++ok_images;

@@ -1,4 +1,5 @@
-// ONNX Runtime backend. Tiles are batched; with the CUDA build, the network
+// ONNX Runtime backend. Regions (SAHI slices, the optional full image) are
+// letterboxed to the input size and batched; with the CUDA build, the network
 // input and output stay in GPU memory (bound with IoBinding), preprocessing and
 // decoding run as CUDA kernels (gpu_ops_cuda.cu), and only the candidate boxes
 // come back to the host.
@@ -113,18 +114,25 @@ public:
         }
         const int S = info_.size;
         int failed = 0, batches = 0;
-        std::vector<int> xy;
+        std::vector<RegionXform> xf;
         std::vector<std::vector<Candidate>> cands;
         for (size_t start = 0; start < tiles.size(); start += info_.batch) {
             const int n = static_cast<int>(std::min<size_t>(info_.batch, tiles.size() - start));
             ++batches;
             try {
-                xy.resize(2 * n);
+                xf.resize(n);
                 for (int i = 0; i < n; ++i) {
-                    xy[2 * i] = tiles[start + i].x;
-                    xy[2 * i + 1] = tiles[start + i].y;
+                    // Letterbox: scale the region to fit size x size, keep its aspect ratio
+                    const Region& r = tiles[start + i];
+                    RegionXform& t = xf[i];
+                    t.rx = r.x; t.ry = r.y; t.rw = r.width; t.rh = r.height;
+                    t.scale = std::min(static_cast<float>(S) / r.width, static_cast<float>(S) / r.height);
+                    t.nw = std::min(S, std::max(1, static_cast<int>(r.width * t.scale)));
+                    t.nh = std::min(S, std::max(1, static_cast<int>(r.height * t.scale)));
+                    t.pad_l = info_.topleft ? 0 : (S - t.nw) / 2;
+                    t.pad_t = info_.topleft ? 0 : (S - t.nh) / 2;
                 }
-                if (!tileops::preprocess(ctx_, xy.data(), n, err)) throw std::runtime_error(err);
+                if (!tileops::preprocess(ctx_, xf.data(), n, err)) throw std::runtime_error(err);
 
                 const std::vector<int64_t> in_shape = {n, 3, S, S};
                 Ort::Value in = Ort::Value::CreateTensor<float>(mem_, tileops::input_buffer(ctx_),
@@ -146,18 +154,23 @@ public:
 
                 if (!tileops::decode(ctx_, n, feature_rows_, info_.xyxy, conf, cands, err)) throw std::runtime_error(err);
                 for (int i = 0; i < n; ++i) {
-                    const Region& t = tiles[start + i];
+                    const RegionXform& t = xf[i];
                     std::vector<Detection> dets;
                     dets.reserve(cands[i].size());
                     for (const Candidate& c : cands[i]) {
-                        if (c.x2 - c.x1 < 1.0f || c.y2 - c.y1 < 1.0f) continue;
-                        dets.push_back({cv::Rect2f(c.x1 + t.x, c.y1 + t.y, c.x2 - c.x1, c.y2 - c.y1), c.score, c.cls});
+                        // Undo the letterbox, clamp to the region, then shift to image coordinates
+                        const float x1 = std::clamp((c.x1 - t.pad_l) / t.scale, 0.0f, static_cast<float>(t.rw));
+                        const float y1 = std::clamp((c.y1 - t.pad_t) / t.scale, 0.0f, static_cast<float>(t.rh));
+                        const float x2 = std::clamp((c.x2 - t.pad_l) / t.scale, 0.0f, static_cast<float>(t.rw));
+                        const float y2 = std::clamp((c.y2 - t.pad_t) / t.scale, 0.0f, static_cast<float>(t.rh));
+                        if (x2 - x1 < 1.0f || y2 - y1 < 1.0f) continue;
+                        dets.push_back({cv::Rect2f(x1 + t.rx, y1 + t.ry, x2 - x1, y2 - y1), c.score, c.cls});
                     }
                     // The head predicts many overlapping boxes per object
                     per_tile[start + i] = apply_class_aware_nms(dets, conf, nms_iou);
                 }
             } catch (const std::exception& e) {
-                std::cerr << "Inference failed on tiles " << start << ".." << (start + n - 1) << ": " << e.what() << "\n";
+                std::cerr << "Inference failed on regions " << start << ".." << (start + n - 1) << ": " << e.what() << "\n";
                 failed += n;
             }
         }
@@ -227,6 +240,17 @@ std::unique_ptr<TileDetector> create_ort_detector(const OrtConfig& cfg, OrtModel
         info.family = meta("model_family");
         const bool libreyolo = !meta("libreyolo_version").empty();
         const int meta_imgsz = std::atoi(meta("imgsz").c_str());
+        const std::string meta_pad = meta("letterbox_pad");
+        if (cfg.pad != "auto") {
+            info.topleft = cfg.pad == "topleft";
+            info.pad_source = "--pad";
+        } else if (meta_pad == "topleft" || meta_pad == "center" || meta_pad == "centre") {
+            info.topleft = meta_pad == "topleft";
+            info.pad_source = "metadata";
+        } else {
+            info.topleft = false;
+            info.pad_source = "default";
+        }
 
         if (session.GetInputCount() < 1 || session.GetOutputCount() < 1) {
             error = "model needs at least one input and one output";

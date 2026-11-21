@@ -37,9 +37,9 @@ float* output_buffer(Context* ctx);
 // The GPU version copies it to device memory; the CPU version keeps the pointer.
 bool set_image(Context* ctx, const uint8_t* bgr, int width, int height, size_t step, std::string& error);
 
-// Write the network input for n tiles, tile i having its top-left corner at
-// (xy[2 i], xy[2 i + 1]): RGB, 0..1, planar (CHW). Finishes before returning.
-bool preprocess(Context* ctx, const int* xy, int n, std::string& error);
+// Write the network input for n regions (letterboxed, RGB, 0..1, planar CHW).
+// Finishes before returning.
+bool preprocess(Context* ctx, const RegionXform* regions, int n, std::string& error);
 
 // For n tiles of head output: the best class per anchor; keeps anchors scoring
 // at least conf. out[i] gets tile i's candidates sorted by anchor index.

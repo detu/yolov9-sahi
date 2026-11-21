@@ -1,10 +1,13 @@
 # yolov9-sahi
 
-YOLOv9 inference using [ncnn](https://github.com/Tencent/ncnn) for a full image using
-tiling: the image is cut into model-sized tiles overlapping by 50%, each tile is run
-through YOLOv9 at native resolution, detections cut by an interior tile edge are dropped
-(the neighbouring tile sees those objects whole), and the rest are merged with one NMS.
-Small objects in large images stay at native resolution.
+YOLOv9 inference using [ncnn](https://github.com/Tencent/ncnn) or ONNX Runtime with CUDA
+for a full image utilizing the SAHI method (Slicing Aided Hyper Inference): the image is
+cut into overlapping slices at the model's input size, each slice is letterboxed and run
+through YOLOv9, and detections are mapped back and merged across slices as in the SAHI
+library. Small objects in large images stay at native resolution.
+
+This is the `sahi-cuda` branch: SAHI with the CUDA backend. The `cuda-backend` branch
+has the same backend with tiling instead of SAHI; `main` has tiling with ncnn.
 
 ## Layout
 
@@ -70,11 +73,12 @@ imgcodecs, dnn). The build type defaults to Release. Pick the inference backend 
 ### CUDA backend (ONNX Runtime + nvcc)
 
 ncnn has no CUDA backend, so the GPU path uses ONNX Runtime's CUDA execution provider.
-The image is copied to the GPU once; CUDA kernels compiled with nvcc cut the tiles out
-and write the network input directly (BGR→RGB, 0–1, planar), a batch of tiles at a time,
+The image is copied to the GPU once; CUDA kernels compiled with nvcc letterbox the regions
+(bilinear resize and gray padding; slices of the input size are copied 1:1) and write the
+network input directly (BGR→RGB, 0–1, planar), a batch of regions at a time,
 and after inference pick the best class per anchor and keep only the candidates above
 the threshold, so just those few boxes come back to the CPU (instead of ~2.7 MB of raw
-output per tile). The network input and output stay in GPU memory (ONNX Runtime
+output per region). The network input and output stay in GPU memory (ONNX Runtime
 IoBinding).
 
 1. **CUDA toolkit** (nvcc) and **cuDNN 9** for your CUDA major version. In WSL2 install
@@ -86,7 +90,7 @@ IoBinding).
    [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases) and unpack
    it. ONNX Runtime 1.27 and later is built for CUDA 13; use an older release or its
    CUDA 12 variant with a CUDA 12 toolkit.
-3. **Model**: export to ONNX with a dynamic batch size, so several tiles run per call:
+3. **Model**: export to ONNX with a dynamic batch size, so several slices run per call:
 
    ```bash
    libreyolo export --model LibreYOLO9t.pt --format onnx --imgsz 640 --dynamic
@@ -111,7 +115,7 @@ IoBinding).
 ```
 
 The startup line shows the GPU (`CUDA (NVIDIA ...)`) and the batch size. `-b/--batch`
-sets the tiles per run (default 8); `--device` picks the GPU. The first run of a new
+sets the slices per run (default 8); `--device` picks the GPU. The first run of a new
 batch size is slower while cuDNN picks its algorithms.
 
 ### ncnn backend (CPU)
@@ -154,71 +158,69 @@ yolov9_sahi <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]   
 | `--csv` | off | write all detections: `image,class_id,class_name,score,x1,y1,x2,y2` |
 | `-n, --names` | `metadata.yaml` | text file of class names, one per line: line 1 = class 0, line 2 = class 1, ... |
 | `-r, --recursive` | off | scan directories recursively |
-| `-s, --size` | `metadata.yaml` imgsz, else 640 | model input size = tile size |
-| `--stride` | half a tile | tile stride in pixels (default: 50% overlap) |
-| `--margin` | 8 | drop detections within this many pixels of an interior tile edge |
-| `--pre-scale` | 1 | downscale the image by this factor (0–1] before tiling: fewer tiles, larger objects fit |
-| `-b, --batch` | 8 | ONNX Runtime: tiles per inference run (models exported with a dynamic batch) |
+| `-s, --size` | model metadata, else 640 | model input size |
+| `--slice` | input size | slice size (slices are letterboxed to the input size) |
+| `--overlap` | 0.20 | slice overlap ratio |
+| `--full` | off | also detect on the whole image (catches objects larger than a slice) |
+| `-b, --batch` | 8 | ONNX Runtime: slices per inference run (models exported with a dynamic batch) |
 | `--device` | 0 | ORT_CUDA: GPU index |
-| `-w, --workers` | physical cores | ncnn: tiles run in parallel (OpenMP) |
-| `-t, --threads` | cores / workers | ncnn: threads per tile |
+| `-w, --workers` | physical cores | ncnn: slices run in parallel (OpenMP) |
+| `-t, --threads` | cores / workers | ncnn: threads per slice |
 | `-j, --cores` | physical cores | ncnn / ORT_CPU: total thread budget |
 | `--gpu` | off | ncnn: Vulkan (needs `-DSAHI_VULKAN=ON`) |
 | `--conf` | 0.25 | confidence threshold |
-| `--iou` | 0.45 | NMS IoU threshold, within a tile and for the final merge |
+| `--iou` | 0.45 | NMS IoU threshold within a slice |
+| `--merge` | `nmm` | merging across slices: `nmm` merges overlapping boxes into one, `nms` keeps the best |
+| `--match` | `ios` | overlap metric for the merge: `ios` (intersection over smaller box) or `iou` |
+| `--match-thresh` | 0.5 | overlap above which boxes are merged |
 | `--box` | model metadata, else detected | box format in the output: `xyxy` or `cxcywh` |
-| `--pad` | `metadata.yaml`, else `center` | ncnn: letterbox placement: `center` or `topleft` |
+| `--pad` | model metadata, else `center` | letterbox placement: `center` or `topleft` |
 | `--in`, `--out` | model's first input/output | input/output names |
 
-### How the tiling works
+### How SAHI works here
 
-1. **Work image.** With `--pre-scale f < 1` the image is first downscaled (area
-   averaging). If it is smaller than one tile, it is padded at the bottom/right with gray
-   (114) to one tile, so coordinates don't move.
-2. **Tile grid.** Tiles are `size × size` (the model input size) at every `stride` pixels
-   (default half a tile, i.e. 50% overlap). The number of tiles per row/column is the
-   smallest that covers the image, and the last tile is clamped to the image border, so
-   there are no partial or duplicate tiles. Tiles are read in place, not copied.
-3. **Per tile.** The tile is normalized to 0–1 RGB and run through YOLOv9; boxes are
-   decoded (best class per anchor) and de-duplicated with class-aware NMS.
-4. **Edge filter.** A detection within `--margin` pixels of an *interior* tile edge (an
-   edge that isn't the image border) is dropped: it is probably cut, and with 50% overlap
-   the neighbouring tile sees the object whole. Detections on the real image border are
-   kept.
-5. **Merge.** The rest is mapped back to the original image (undoing the pre-scale),
-   clipped to the real image (dropping the gray padding) and merged with one class-aware
-   NMS, which removes objects seen whole by two overlapping tiles.
+1. **Slices.** The image is cut into `slice × slice` slices (default: the model input
+   size) overlapping by `--overlap` (default 20%); the last slice in each row/column is
+   shifted back to end at the image border, so slices keep their full size. With
+   `--full`, the whole image is added as one more region.
+2. **Per region.** Each region is letterboxed to the input size (aspect ratio kept, gray
+   padding centred, or top-left for LibreYOLO-trained checkpoints, from the model's
+   metadata), normalized to 0–1 RGB and run through YOLOv9; boxes are decoded (best class
+   per anchor), mapped back to the image and de-duplicated within the region with
+   class-aware NMS.
+3. **Merge.** An object cut by a slice edge appears as a full box from one slice plus a
+   fragment from its neighbour, or as two halves. As in the SAHI library, the default
+   merge is greedy NMM with the IOS metric: boxes of the same class whose intersection
+   covers more than half of the smaller box are merged into their union, keeping the
+   best score. Use `--merge nms --match iou` for plain NMS.
 
-Output is deterministic regardless of the number of threads.
-
-Objects larger than about a tile can't be seen whole by any tile, so the edge filter
-drops them. Use `--pre-scale` to shrink such images until the large objects fit in a
-tile. For example, `--pre-scale 0.5` turns a 4000 px wide image into tiles that cover
-1280 px of the original.
+Output is deterministic regardless of the number of threads or the batch size. SAHI works
+best when objects are smaller than a slice; add `--full` when the images also contain
+objects much larger than a slice.
 
 ### Threading
 
-By default the program runs **one tile per physical core, with ncnn single-threaded**.
-Tiling produces many equal tiles, and running them side by side scales almost linearly,
-while ncnn's own per-layer threading scales worse on a single 640×640 tile and nesting the
-two levels costs extra. Measured on 2 cores with YOLOv9-C, 35 tiles:
+With ncnn, the program runs **one slice per physical core, with ncnn single-threaded**.
+SAHI produces many equal slices, and running them side by side scales almost linearly,
+while ncnn's own per-layer threading scales worse on a single 640×640 slice and nesting the
+two levels costs extra. Measured on 2 cores with YOLOv9-C, 35 regions:
 
 | Setup | Inference | vs 1 core |
 |---|---|---|
 | 1 core | 32.0 s | 1.0× |
-| 1 tile × 2 ncnn threads | 21.8 s | 1.47× |
-| 2 tiles × 1 thread (default) | 16.1 s | 1.99× |
+| 1 slice × 2 ncnn threads | 21.8 s | 1.47× |
+| 2 slices × 1 thread (default) | 16.1 s | 1.99× |
 
 Details:
 
 - The split is fixed at startup: ncnn's convolution layers fix their thread count when
-  the model is loaded. `-w` (tiles in parallel) and `-t` (ncnn threads per tile) override
+  the model is loaded. `-w` (slices in parallel) and `-t` (ncnn threads per slice) override
   it; `-j` sets the total budget (default: physical cores; hyperthreads add little here).
-- Images that fit in a single tile can't use tile parallelism. For those, a second copy
+- Images that fit in a single slice can't use slice parallelism. For those, a second copy
   of the model with all cores is loaded the first time such an image appears.
-- All tiles share one copy of the model weights; each worker has its own ncnn memory pools
-  (by default ncnn's extractors share one locked pool, which serializes concurrent tiles).
-- With several tiles in flight, ncnn threads don't spin-wait between layers, so idle
-  threads don't take cores from other tiles.
+- All slices share one copy of the model weights; each worker has its own ncnn memory pools
+  (by default ncnn's extractors share one locked pool, which serializes concurrent slices).
+- With several slices in flight, ncnn threads don't spin-wait between layers, so idle
+  threads don't take cores from other slices.
 - The next image is decoded and the previous result is drawn and saved in the background
   while the current image runs.

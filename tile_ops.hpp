@@ -1,4 +1,4 @@
-// Per-element tile pre/post-processing, shared by the CUDA kernels
+// Per-element region pre/post-processing, shared by the CUDA kernels
 // (gpu_ops_cuda.cu, compiled with nvcc) and the CPU fallback (gpu_ops_cpu.cpp),
 // so both compute exactly the same thing.
 #pragma once
@@ -20,13 +20,40 @@ struct Candidate {
     int anchor;  // anchor index, used to restore a deterministic order
 };
 
-// Network input value at channel c (0 = R, 1 = G, 2 = B), row y, column x of
-// the tile whose top-left corner is (tile_x, tile_y): RGB, scaled to 0..1.
-// `bgr` is an 8-bit BGR image with rows `step` bytes apart. Tiles are exactly
-// the input size, so there is no resizing or letterbox padding.
-TILE_HD float tile_input_value(const uint8_t* bgr, size_t step, int tile_x, int tile_y, int c, int y, int x) {
-    return bgr[static_cast<size_t>(tile_y + y) * step + static_cast<size_t>(tile_x + x) * 3 + (2 - c)] *
-           (1.0f / 255.0f);
+// How one image region maps onto the size x size network input: resized by
+// `scale` to nw x nh and placed at (pad_l, pad_t); the rest is gray (114).
+struct RegionXform {
+    int rx, ry, rw, rh;  // region in the image
+    int nw, nh;          // resized size
+    int pad_l, pad_t;    // offset of the resized region in the input
+    float scale;         // nw / rw (= nh / rh)
+};
+
+// Network input value at channel c (0 = R, 1 = G, 2 = B), row y, column x for
+// one region: letterboxed, RGB, scaled to 0..1. `bgr` is an 8-bit BGR image
+// with rows `step` bytes apart. Resizing is bilinear with half-pixel centres
+// (as cv::resize INTER_LINEAR); a region that is exactly the input size is
+// copied 1:1.
+TILE_HD float letterbox_input_value(const uint8_t* bgr, size_t step, const RegionXform& t, int c, int y, int x) {
+    const int lx = x - t.pad_l, ly = y - t.pad_t;
+    if (lx < 0 || ly < 0 || lx >= t.nw || ly >= t.nh) return 114.0f / 255.0f;
+    const int ch = 2 - c;
+    if (t.nw == t.rw && t.nh == t.rh) {
+        return bgr[static_cast<size_t>(t.ry + ly) * step + static_cast<size_t>(t.rx + lx) * 3 + ch] * (1.0f / 255.0f);
+    }
+    float u = (lx + 0.5f) * (static_cast<float>(t.rw) / t.nw) - 0.5f;
+    float v = (ly + 0.5f) * (static_cast<float>(t.rh) / t.nh) - 0.5f;
+    u = u < 0.f ? 0.f : (u > t.rw - 1 ? static_cast<float>(t.rw - 1) : u);
+    v = v < 0.f ? 0.f : (v > t.rh - 1 ? static_cast<float>(t.rh - 1) : v);
+    const int x0 = static_cast<int>(u), y0 = static_cast<int>(v);
+    const int x1 = x0 + 1 < t.rw ? x0 + 1 : x0, y1 = y0 + 1 < t.rh ? y0 + 1 : y0;
+    const float fx = u - x0, fy = v - y0;
+    auto px = [&](int yy, int xx) {
+        return static_cast<float>(bgr[static_cast<size_t>(t.ry + yy) * step + static_cast<size_t>(t.rx + xx) * 3 + ch]);
+    };
+    const float top = px(y0, x0) + (px(y0, x1) - px(y0, x0)) * fx;
+    const float bot = px(y1, x0) + (px(y1, x1) - px(y1, x0)) * fx;
+    return (top + (bot - top) * fy) * (1.0f / 255.0f);
 }
 
 // Best class and box of anchor `a` in one tile's head output: F = 4 + classes
