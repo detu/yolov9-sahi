@@ -101,8 +101,9 @@ yolov9_sahi <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]
 | `-s, --size` | `metadata.yaml` imgsz, else 640 | model input size |
 | `--slice` | input size | tile size (tiles are letterboxed to the input size) |
 | `--full` | off | also detect on the whole image (catches objects larger than a tile) |
-| `-w, --workers` | 2 | tiles processed in parallel (OpenMP) |
-| `-t, --threads` | cores / workers | ncnn threads per worker |
+| `-w, --workers` | physical cores | tiles run in parallel (OpenMP) |
+| `-t, --threads` | cores / workers | ncnn threads per tile |
+| `-j, --cores` | physical cores | total thread budget |
 | `--gpu` | off | Vulkan (needs `-DSAHI_VULKAN=ON`) |
 | `--overlap` | 0.20 | tile overlap ratio |
 | `--conf` | 0.25 | confidence threshold |
@@ -114,19 +115,34 @@ yolov9_sahi <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]
 | `--pad` | `metadata.yaml`, else `center` | letterbox placement: `center` or `topleft` |
 | `--in`, `--out` | model's first input/output (`in0`, `out0`) | ncnn blob names |
 
-Each tile is letterboxed (gray padding, centred or top-left) to the input size, normalized to 0–1 RGB
-and run through the network; boxes are decoded (best class per anchor), mapped back to
-the image and de-duplicated within the tile with class-aware NMS.
+Each tile is letterboxed (gray padding, centred or top-left) to the input size, normalized
+to 0–1 RGB and run through the network; boxes are decoded (best class per anchor), mapped
+back to the image and de-duplicated within the tile with class-aware NMS. Output is
+deterministic regardless of the number of threads.
 
-Across tiles, an object cut by a tile edge appears as a full box from one tile plus a
-fragment from its neighbour, or as two halves. As in the SAHI library, the default merge
-is greedy NMM with the IOS metric: boxes of the same class whose intersection covers more
-than half of the smaller box are merged into their union, keeping the best score. Use
-`--merge nms --match iou` for plain NMS. SAHI works best when objects are smaller than a
-tile; add `--full` when the images also contain objects much larger than a tile. All workers share
-one copy of the model (ncnn runs several extractors on one network concurrently), and
-the next image is decoded in the background while the current one is processed. Output
-is deterministic regardless of the number of workers.
+### Threading
 
-On CPU, keep `workers × threads` at or below your physical core count; many workers with
-few threads each usually gives the best throughput on many tiles.
+By default the program runs **one tile per physical core, with ncnn single-threaded**.
+SAHI produces many equal tiles, and running them side by side scales almost linearly,
+while ncnn's own per-layer threading scales worse on a single 640×640 tile and nesting the
+two levels costs extra. Measured on 2 cores with YOLOv9-C, 35 tiles:
+
+| Setup | Inference | vs 1 core |
+|---|---|---|
+| 1 core | 32.0 s | 1.0× |
+| 1 tile × 2 ncnn threads | 21.8 s | 1.47× |
+| 2 tiles × 1 thread (default) | 16.1 s | 1.99× |
+
+Details:
+
+- The split is fixed at startup: ncnn's convolution layers fix their thread count when
+  the model is loaded. `-w` (tiles in parallel) and `-t` (ncnn threads per tile) override
+  it; `-j` sets the total budget (default: physical cores; hyperthreads add little here).
+- Images that fit in a single tile can't use tile parallelism. For those, a second copy
+  of the model with all cores is loaded the first time such an image appears.
+- All tiles share one copy of the model weights; each worker has its own ncnn memory pools
+  (by default ncnn's extractors share one locked pool, which serializes concurrent tiles).
+- With several tiles in flight, ncnn threads don't spin-wait between layers, so idle
+  threads don't take cores from other tiles.
+- The next image is decoded and the previous result is drawn and saved in the background
+  while the current image runs.

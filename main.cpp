@@ -15,6 +15,7 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,7 +27,8 @@
 #include <omp.h>
 #endif
 
-#include "net.h"  // ncnn
+#include "cpu.h"  // ncnn
+#include "net.h"
 #if NCNN_VULKAN
 #include "gpu.h"
 #endif
@@ -58,8 +60,9 @@ struct Options {
     bool gpu = false;                 // Vulkan, if ncnn was built with it
     int size = 0;                     // model input size (0 = metadata.yaml or 640)
     int slice = 0;                    // tile size (0 = model input size)
-    int workers = 0;                  // parallel tile workers (0 = auto)
-    int threads_per_worker = 0;       // ncnn threads per worker (0 = auto)
+    int workers = 0;                  // parallel tile workers (0 = auto: one per core, up to the tile count)
+    int threads_per_worker = 0;       // ncnn threads per worker (0 = auto: cores / workers)
+    int cores = 0;                    // thread budget (0 = physical cores)
     float overlap = 0.20f;
     float conf = 0.25f;
     float nms_iou = 0.45f;
@@ -72,12 +75,13 @@ struct Options {
 // Command line
 // ---------------------------------------------------------------------------
 
-static int hardware_threads() {
-#ifdef _OPENMP
-    return std::max(1, omp_get_num_procs());
-#else
-    return std::max(1u, std::thread::hardware_concurrency());
-#endif
+// Thread budget: physical cores. ncnn's kernels share each core's vector units,
+// so hyperthreads add little and mostly cause contention.
+static int physical_cores() {
+    int n = ncnn::get_physical_big_cpu_count();
+    if (n <= 0) n = ncnn::get_physical_cpu_count();
+    if (n <= 0) n = static_cast<int>(std::thread::hardware_concurrency());
+    return std::max(1, n);
 }
 
 static void print_usage(const char* prog) {
@@ -97,8 +101,9 @@ static void print_usage(const char* prog) {
         << "  -s, --size <n>         model input size (default: imgsz from metadata.yaml, else 640)\n"
         << "      --slice <n>        tile size (default: model input size)\n"
         << "      --full             also detect on the whole image (finds large objects)\n"
-        << "  -w, --workers <n>      tiles processed in parallel (default: 2)\n"
-        << "  -t, --threads <n>      ncnn threads per worker (default: cores / workers)\n"
+        << "  -w, --workers <n>      tiles run in parallel, max (default: one per core, never more than tiles)\n"
+        << "  -t, --threads <n>      ncnn threads per tile (default: cores / workers for each image)\n"
+        << "  -j, --cores <n>        total thread budget (default: physical CPU cores)\n"
         << "      --gpu              use Vulkan (needs a build with -DSAHI_VULKAN=ON)\n"
         << "      --overlap <r>      tile overlap ratio (default: 0.20)\n"
         << "      --conf <c>         confidence threshold (default: 0.25)\n"
@@ -138,6 +143,7 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "--full")                   { opt.full = true; }
         else if (a == "-w" || a == "--workers")   { if (!(v = next("--workers"))) return false; opt.workers = std::atoi(v); }
         else if (a == "-t" || a == "--threads")   { if (!(v = next("--threads"))) return false; opt.threads_per_worker = std::atoi(v); }
+        else if (a == "-j" || a == "--cores")     { if (!(v = next("--cores")))   return false; opt.cores = std::atoi(v); }
         else if (a == "--gpu")                    { opt.gpu = true; }
         else if (a == "--overlap")                { if (!(v = next("--overlap"))) return false; opt.overlap = std::strtof(v, nullptr); }
         else if (a == "--conf")                   { if (!(v = next("--conf")))    return false; opt.conf = std::strtof(v, nullptr); }
@@ -425,7 +431,8 @@ static std::vector<Detection> merge_detections(const std::vector<Detection>& det
     for (auto& kv : by_class) groups.push_back(std::move(kv.second));
     std::vector<std::vector<Detection>> kept(groups.size());
 
-    #pragma omp parallel for schedule(dynamic, 1) if (groups.size() > 1)
+    // Worth threads only when there are many boxes; usually this takes microseconds.
+    #pragma omp parallel for schedule(dynamic, 1) if (groups.size() > 1 && dets.size() > 4000)
     for (int g = 0; g < static_cast<int>(groups.size()); ++g) {
         std::vector<size_t> order = groups[g];
         std::stable_sort(order.begin(), order.end(),
@@ -512,15 +519,32 @@ static bool decode_yolo(const ncnn::Mat& out_raw, bool xyxy, float conf, float s
     const int n_cls = v.n_feat - 4;
     auto at = [&](int f, int a) { return v.at(f, a); };
 
-    for (int a = 0; a < v.n_anchor; ++a) {
-        int best = 0;
-        float best_score = at(4, a);
+    // Best class per anchor. In the usual (features x anchors) layout each class
+    // is one contiguous row, so scan row by row (sequential memory, vectorizes)
+    // instead of jumping a whole row per class for every anchor.
+    std::vector<float> best_score(v.n_anchor);
+    std::vector<int> best_cls(v.n_anchor, 0);
+    if (v.feature_rows) {
+        const float* row = v.out.row(4);
+        std::copy(row, row + v.n_anchor, best_score.begin());
         for (int c = 1; c < n_cls; ++c) {
-            const float s = at(4 + c, a);
-            if (s > best_score) { best_score = s; best = c; }
+            row = v.out.row(4 + c);
+            for (int a = 0; a < v.n_anchor; ++a) {
+                if (row[a] > best_score[a]) { best_score[a] = row[a]; best_cls[a] = c; }
+            }
         }
-        if (best_score < conf) continue;
+    } else {
+        for (int a = 0; a < v.n_anchor; ++a) {
+            const float* p = v.out.row(a) + 4;
+            int best = 0;
+            for (int c = 1; c < n_cls; ++c) if (p[c] > p[best]) best = c;
+            best_score[a] = p[best];
+            best_cls[a] = best;
+        }
+    }
 
+    for (int a = 0; a < v.n_anchor; ++a) {
+        if (best_score[a] < conf) continue;
         float bx1, by1, bx2, by2;
         if (xyxy) {
             bx1 = at(0, a); by1 = at(1, a); bx2 = at(2, a); by2 = at(3, a);
@@ -537,8 +561,8 @@ static bool decode_yolo(const ncnn::Mat& out_raw, bool xyxy, float conf, float s
 
         Detection d;
         d.box = cv::Rect2f(x1 + r.x, y1 + r.y, x2 - x1, y2 - y1);
-        d.confidence = best_score;
-        d.class_id = best;
+        d.confidence = best_score[a];
+        d.class_id = best_cls[a];
         dets.push_back(d);
     }
     return true;
@@ -547,8 +571,21 @@ static bool decode_yolo(const ncnn::Mat& out_raw, bool xyxy, float conf, float s
 // Letterbox one region of the image to size x size (gray 114 padding, centred or top-left),
 // run YOLOv9 and return its detections (after per-region NMS) in image coordinates.
 // Uses its own Extractor, so it is safe to call concurrently on the same Net.
+// Per-worker memory pools, reused for every tile and image. By default all
+// extractors share the network's one locked pool, so concurrent tiles would
+// queue on its mutex; this is the setup ncnn's own benchmark uses.
+struct WorkerPools {
+    ncnn::UnlockedPoolAllocator blob;
+    ncnn::PoolAllocator workspace;
+    WorkerPools() {
+        blob.set_size_compare_ratio(0.f);
+        workspace.set_size_compare_ratio(0.f);
+    }
+};
+
 static bool detect_region(const ncnn::Net& net, const ModelInfo& mi, const cv::Mat& bgr,
-                          const Region& r, float conf, float nms_iou, std::vector<Detection>& out) {
+                          const Region& r, float conf, float nms_iou, WorkerPools* pools,
+                          std::vector<Detection>& out) {
     const int S = mi.size;
     const float scale = std::min(static_cast<float>(S) / r.width, static_cast<float>(S) / r.height);
     const int nw = std::min(S, std::max(1, static_cast<int>(r.width * scale)));
@@ -567,6 +604,10 @@ static bool detect_region(const ncnn::Net& net, const ModelInfo& mi, const cv::M
     in.substract_mean_normalize(nullptr, norm);
 
     ncnn::Extractor ex = net.create_extractor();
+    if (pools) {
+        ex.set_blob_allocator(&pools->blob);
+        ex.set_workspace_allocator(&pools->workspace);
+    }
     if (ex.input(mi.in_blob.c_str(), in) != 0) {
         std::fprintf(stderr, "Cannot feed input blob '%s'\n", mi.in_blob.c_str());
         return false;
@@ -586,12 +627,37 @@ static bool detect_region(const ncnn::Net& net, const ModelInfo& mi, const cv::M
     return true;
 }
 
+// How the thread budget is spread over the tiles. ncnn's convolution layers
+// fix their thread count when the model is loaded (weights are pre-arranged
+// for it), so the split is chosen once at startup, not per image.
+struct ThreadPlan {
+    int workers = 1;   // tiles in flight at once (outer OpenMP)
+    int threads = 1;   // ncnn threads per tile (inner OpenMP)
+};
+
+// Default: one tile per core with ncnn single-threaded. SAHI produces many
+// equal tiles, and this scales almost linearly with no nested OpenMP teams and
+// no idle spin-waiting; ncnn's per-layer threading scales worse on one small
+// 640x640 tile. -w / -t override.
+static ThreadPlan plan_threads(int cores, const Options& opt) {
+    ThreadPlan p;
+    p.workers = opt.workers > 0 ? opt.workers : cores;
+    p.threads = opt.threads_per_worker > 0 ? opt.threads_per_worker : std::max(1, cores / p.workers);
+#ifndef _OPENMP
+    p.workers = 1;
+#endif
+    return p;
+}
+
 // Run SAHI on one image; returns merged detections. Results go into per-region
 // slots and are concatenated in order, so the output does not depend on thread
-// scheduling.
-static std::vector<Detection> run_sahi(const ncnn::Net& net, const ModelInfo& mi, const cv::Mat& bgr,
-                                       int slice_size, int workers, const Options& opt,
-                                       size_t& n_regions, size_t& n_raw, int& failed) {
+// scheduling. `wide` (all cores in one extraction) is used when the image is a
+// single region and the tile plan would leave cores idle; it is null otherwise.
+static std::vector<Detection> run_sahi(const ncnn::Net& net, const ncnn::Net* wide, const ModelInfo& mi,
+                                       const cv::Mat& bgr, int slice_size, const ThreadPlan& plan,
+                                       std::vector<std::unique_ptr<WorkerPools>>& pools, bool use_pools,
+                                       const Options& opt, size_t& n_regions, size_t& n_raw, int& failed,
+                                       ThreadPlan& used) {
     std::vector<Region> regions = generate_slices(bgr.cols, bgr.rows, slice_size, slice_size, opt.overlap);
     // Optional full-image pass (SAHI's "standard prediction"): skip when one tile already covers everything
     if (opt.full && !(regions.size() == 1 && regions[0].width == bgr.cols && regions[0].height == bgr.rows)) {
@@ -599,14 +665,27 @@ static std::vector<Detection> run_sahi(const ncnn::Net& net, const ModelInfo& mi
     }
     n_regions = regions.size();
 
-    const int n_workers = std::max(1, std::min<int>(workers, static_cast<int>(regions.size())));
     std::vector<std::vector<Detection>> per_region(regions.size());
     int n_failed = 0;
-    (void)n_workers;  // only used by the OpenMP pragma
 
-    #pragma omp parallel for num_threads(n_workers) schedule(dynamic, 1) reduction(+ : n_failed)
-    for (int i = 0; i < static_cast<int>(regions.size()); ++i) {
-        if (!detect_region(net, mi, bgr, regions[i], opt.conf, opt.nms_iou, per_region[i])) ++n_failed;
+    if (regions.size() == 1 && wide) {
+        used = {1, wide->opt.num_threads};
+        if (!detect_region(*wide, mi, bgr, regions[0], opt.conf, opt.nms_iou,
+                           use_pools ? pools[0].get() : nullptr, per_region[0])) ++n_failed;
+    } else {
+        const int n_workers = std::max(1, std::min<int>(plan.workers, static_cast<int>(regions.size())));
+        used = {n_workers, plan.threads};
+        (void)n_workers;  // unused without OpenMP
+
+        #pragma omp parallel for num_threads(n_workers) schedule(dynamic, 1) reduction(+ : n_failed)
+        for (int i = 0; i < static_cast<int>(regions.size()); ++i) {
+#ifdef _OPENMP
+            WorkerPools* wp = use_pools ? pools[omp_get_thread_num()].get() : nullptr;
+#else
+            WorkerPools* wp = use_pools ? pools[0].get() : nullptr;
+#endif
+            if (!detect_region(net, mi, bgr, regions[i], opt.conf, opt.nms_iou, wp, per_region[i])) ++n_failed;
+        }
     }
     failed = n_failed;
 
@@ -725,19 +804,15 @@ int main(int argc, char** argv) {
 
     // ---- Load the model once. One Net is shared by all workers: each tile gets
     //      its own Extractor, which ncnn allows concurrently. ----
-    const int hw = hardware_threads();
-    const int workers = opt.workers > 0 ? opt.workers : 2;
-    const int threads_per_worker = opt.threads_per_worker > 0 ? opt.threads_per_worker
-                                                              : std::max(1, hw / workers);
+    const int cores = opt.cores > 0 ? opt.cores : physical_cores();
+    const ThreadPlan plan = plan_threads(cores, opt);
 
-    ncnn::Net net;
-    net.opt.num_threads = threads_per_worker;
-    net.opt.lightmode = true;  // free intermediate blobs as soon as possible
+    bool use_gpu = false;
     std::string device = "CPU";
     if (opt.gpu) {
 #if NCNN_VULKAN
         if (ncnn::get_gpu_count() > 0) {
-            net.opt.use_vulkan_compute = true;
+            use_gpu = true;
             device = std::string("Vulkan (") + ncnn::get_gpu_info(0).device_name() + ")";
         } else {
             std::cerr << "Warning: no Vulkan device found; using CPU\n";
@@ -747,14 +822,51 @@ int main(int argc, char** argv) {
 #endif
     }
 
-    if (net.load_param(param_path.string().c_str()) != 0) {
-        std::cerr << "Failed to load " << param_path << "\n";
-        return 1;
-    }
-    if (net.load_model(bin_path.string().c_str()) != 0) {
-        std::cerr << "Failed to load " << bin_path << "\n";
-        return 1;
-    }
+    auto load_net = [&](ncnn::Net& n, int threads, bool concurrent) {
+        n.opt.num_threads = threads;
+        n.opt.lightmode = true;  // free intermediate blobs as soon as possible
+        n.opt.use_vulkan_compute = use_gpu;
+        // With several tiles in flight, idle ncnn threads must not spin-wait
+        // for work (default 20 ms): they would burn cores other tiles need.
+        n.opt.openmp_blocktime = concurrent ? 0 : 20;
+        if (n.load_param(param_path.string().c_str()) != 0) {
+            std::cerr << "Failed to load " << param_path << "\n";
+            return false;
+        }
+        if (n.load_model(bin_path.string().c_str()) != 0) {
+            std::cerr << "Failed to load " << bin_path << "\n";
+            return false;
+        }
+        return true;
+    };
+
+    ncnn::Net net;
+    if (!load_net(net, plan.threads, plan.workers > 1)) return 1;
+
+#ifdef _OPENMP
+    // Nested OpenMP only when both levels have threads to use.
+    omp_set_max_active_levels(plan.workers > 1 && plan.threads > 1 ? 2 : 1);
+#endif
+
+    // Images that fit in one tile get no tile parallelism; when the tile plan
+    // leaves cores idle, those run on a second copy of the model loaded with
+    // all cores. Loaded only when such an image first shows up.
+    std::unique_ptr<ncnn::Net> wide_net;
+    bool wide_tried = false;
+    auto get_wide = [&]() -> const ncnn::Net* {
+        if (use_gpu || plan.threads >= cores) return nullptr;
+        if (!wide_tried) {
+            wide_tried = true;
+            auto n = std::make_unique<ncnn::Net>();
+            if (load_net(*n, cores, false)) wide_net = std::move(n);
+        }
+        return wide_net.get();
+    };
+
+    // One memory pool pair per worker (CPU only; Vulkan uses its own allocators)
+    const bool use_pools = !use_gpu;
+    std::vector<std::unique_ptr<WorkerPools>> pools;
+    for (int w = 0; w < std::max(1, plan.workers); ++w) pools.push_back(std::make_unique<WorkerPools>());
 
     ModelInfo mi;
     mi.size = opt.size;
@@ -810,18 +922,14 @@ int main(int argc, char** argv) {
         }
     }
 
-#ifdef _OPENMP
-    // ncnn parallelizes each layer with its own OpenMP region. Allow one
-    // nested level so each worker's inference still gets its threads.
-    omp_set_max_active_levels(2);
-#endif
+    const std::string plan_desc = std::to_string(cores) + " cores: " + std::to_string(plan.workers) +
+                                  " tile(s) in parallel x " + std::to_string(plan.threads) + " thread(s)";
 
     const double init_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
     std::cout << "Model: " << param_path.string() << " + " << bin_path.filename().string() << " (" << mi.in_blob << " -> " << mi.out_blob
               << ", input " << mi.size << "x" << mi.size << ", boxes " << (mi.xyxy ? "xyxy" : "cxcywh")
               << " (" << box_source << "), pad " << (mi.topleft ? "topleft" : "center") << " (" << pad_source
-              << ")) | " << device << " | "
-              << workers << " worker(s) x " << threads_per_worker << " thread(s)"
+              << ")) | " << device << " | " << plan_desc
 #ifndef _OPENMP
               << " [built without OpenMP: tiles run sequentially]"
 #endif
@@ -847,6 +955,8 @@ int main(int argc, char** argv) {
     double total_infer_ms = 0.0;
     auto load = [](const fs::path& p) { return cv::imread(p.string(), cv::IMREAD_COLOR); };
     std::future<cv::Mat> next = std::async(std::launch::async, load, images[0]);
+    std::future<bool> pending_save;
+    size_t unsaved = 0;
 
     for (size_t idx = 0; idx < images.size(); ++idx) {
         const fs::path& path = images[idx];
@@ -862,8 +972,12 @@ int main(int argc, char** argv) {
 
         size_t n_regions = 0, n_raw = 0;
         int failed = 0;
+        ThreadPlan used;
+        const bool one_region = generate_slices(bgr.cols, bgr.rows, slice_size, slice_size, opt.overlap).size() == 1;
+        const ncnn::Net* wide = one_region ? get_wide() : nullptr;  // loads on first use: not timed
         const auto ti = clock::now();
-        std::vector<Detection> merged = run_sahi(net, mi, bgr, slice_size, workers, opt, n_regions, n_raw, failed);
+        std::vector<Detection> merged = run_sahi(net, wide, mi, bgr, slice_size, plan, pools, use_pools, opt,
+                                                 n_regions, n_raw, failed, used);
         const double infer_ms = std::chrono::duration<double, std::milli>(clock::now() - ti).count();
 
         if (!class_names.empty()) {
@@ -872,14 +986,21 @@ int main(int argc, char** argv) {
             }
         }
 
-        draw_detections(bgr, merged, class_names);
+        // Draw and encode the output in the background while the next image is
+        // processed; the previous save is collected first (one in flight at a time).
+        if (pending_save.valid() && !pending_save.get()) ++unsaved;
         const fs::path out = output_for(path);
-        bool saved = false;
-        try {
-            saved = cv::imwrite(out.string(), bgr);
-        } catch (const cv::Exception& e) {
-            std::cerr << "imwrite error: " << e.what() << "\n";
-        }
+        pending_save = std::async(std::launch::async,
+                                  [bgr, merged, out, &class_names]() mutable {
+                                      draw_detections(bgr, merged, class_names);
+                                      try {
+                                          if (cv::imwrite(out.string(), bgr)) return true;
+                                      } catch (const cv::Exception& e) {
+                                          std::cerr << "imwrite error: " << e.what() << "\n";
+                                      }
+                                      std::cerr << "Could not save " << out.string() << "\n";
+                                      return false;
+                                  });
 
         if (csv.is_open()) {
             for (const auto& d : merged) {
@@ -890,15 +1011,20 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::printf("%zu regions, %zu raw -> %zu dets, %.1f ms%s%s\n",
-                    n_regions, n_raw, merged.size(), infer_ms,
-                    failed ? (" | " + std::to_string(failed) + " region(s) failed").c_str() : "",
-                    saved ? "" : " | could not save output");
+        std::printf("%zu regions (%d x %d thr), %zu raw -> %zu dets, %.1f ms%s\n",
+                    n_regions, used.workers, used.threads, n_raw, merged.size(), infer_ms,
+                    failed ? (" | " + std::to_string(failed) + " region(s) failed").c_str() : "");
         std::fflush(stdout);
 
-        if (failed == static_cast<int>(n_regions) || !saved) ++failed_images; else ++ok_images;
+        if (failed == static_cast<int>(n_regions)) ++failed_images; else ++ok_images;
         total_dets += merged.size();
         total_infer_ms += infer_ms;
+    }
+
+    if (pending_save.valid() && !pending_save.get()) ++unsaved;
+    if (unsaved > 0) {
+        failed_images += unsaved;
+        ok_images -= std::min(ok_images, unsaved);
     }
 
     const double total_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
