@@ -1,4 +1,4 @@
-// Shared types for the inference backends (ncnn, ONNX Runtime).
+// Shared types: detections, regions and class-aware NMS.
 #pragma once
 
 #include <map>
@@ -16,22 +16,6 @@ struct Detection {
 
 struct Region {
     int x, y, width, height;
-};
-
-// Runs the model on tiles of a work image. Every tile is exactly size x size
-// pixels (the model input size). per_tile[i] receives tile i's detections in
-// work-image coordinates, after class-aware NMS within the tile.
-class TileDetector {
-public:
-    virtual ~TileDetector() = default;
-    // Returns the number of tiles that failed.
-    virtual int detect(const cv::Mat& work_bgr, const std::vector<Region>& tiles, float conf, float nms_iou,
-                       std::vector<std::vector<Detection>>& per_tile) = 0;
-    // Called before detect() with the image's tile count, outside the timed part
-    // (e.g. to load something on first use).
-    virtual void prepare(size_t /*n_tiles*/) {}
-    // How the last detect() call ran, for the progress line (e.g. "8 x 1 thr", "batch 8").
-    virtual std::string last_run_desc() const = 0;
 };
 
 // Class-aware NMS: classes don't suppress each other. Output order is

@@ -1,10 +1,15 @@
-// YOLOv9 + SAHI (Slicing Aided Hyper Inference).
+// YOLOv9 + SAHI (Slicing Aided Hyper Inference) with MNN (CUDA, Vulkan or CPU).
 //
 // The image is cut into overlapping slices at the model's input size (and,
 // with --full, the whole image is added as one more region). Every region is
-// letterboxed and run through YOLOv9 (ONNX Runtime with CUDA, or ncnn),
-// detections are mapped back to the image, and duplicates and fragments across
-// slice borders are merged as in the SAHI library (greedy NMM with IOS).
+// letterboxed with YOLOv9's preprocessing (RGB, 0..1, OpenCV-style bilinear
+// resize, gray padding, centred unless the model says top-left) and run
+// through YOLOv9; detections are mapped back to
+// the image, and duplicates and fragments across slice borders are merged as
+// in the SAHI library (greedy NMM with IOS).
+//
+// The model is given as .onnx (converted once to .mnn with MNN's converter,
+// next to the .onnx) or directly as .mnn.
 
 #include <algorithm>
 #include <cctype>
@@ -14,7 +19,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <future>
 #include <iostream>
 #include <map>
@@ -31,46 +35,32 @@
 #endif
 
 #include "detector.hpp"
-
-#if SAHI_NCNN
-#include "cpu.h"  // ncnn
-#include "net.h"
-#if NCNN_VULKAN
-#include "gpu.h"
-#endif
-#endif
-
-#if SAHI_ORT
-#include "ort_detector.hpp"
-#endif
-
-#if !SAHI_NCNN && !SAHI_ORT
-#error "Build with SAHI_NCNN=1 or SAHI_ORT=1 (set by CMakeLists.txt through SAHI_BACKEND)"
-#endif
+#include "region_detector.hpp"
+#include "onnx_meta.hpp"
+#include "region_ops.hpp"
 
 namespace fs = std::filesystem;
 
 struct Options {
-    std::string param;                // ncnn: model structure (.param)
-    std::string bin;                  // ncnn: model weights (.bin)
-    std::string onnx;                 // ONNX Runtime: model (.onnx)
-    int batch = 8;                    // ONNX Runtime: tiles per run (models with a dynamic batch)
-    int device = 0;                   // ONNX Runtime CUDA: GPU index
+    std::string model;                // .onnx or .mnn
     std::vector<std::string> inputs;  // image files and/or directories
     std::string output;               // -o: output file (single image) or directory
     std::string csv_path;             // --csv: optional detections CSV
     std::string names_path;           // --names: class names, one per line (line 1 = class 0)
-    std::string in_blob, out_blob;    // ncnn blob names (default: first input/output)
-    std::string box = "auto";         // box format in the output: auto, xyxy or cxcywh
-    std::string pad = "auto";         // letterbox placement: auto, center or topleft
+    std::string backend = "auto";     // auto or one of available_backends()
+    std::string precision = "normal"; // normal, high, low
+    std::string preprocess = "auto";  // auto (metadata, else yolo), yolo, rtmdet
+    std::string pad = "auto";         // auto (metadata, else per preprocessing), center, topleft
+    std::string box = "auto";         // auto, xyxy, cxcywh
+    std::string in_name, out_name;
     bool recursive = false;
-    bool gpu = false;                 // Vulkan, if ncnn was built with it
     bool full = false;                // also run on the whole (letterboxed) image
-    int size = 0;                     // model input size (0 = model metadata or 640)
+    bool fp16 = false;                // convert with fp16 weights
+    bool reconvert = false;           // convert again even if the .mnn is up to date
+    int size = 0;                     // model input size (0 = metadata, input shape, else 640)
     int slice = 0;                    // slice size (0 = model input size)
-    int workers = 0;                  // parallel tile workers (0 = auto: one per core, up to the tile count)
-    int threads_per_worker = 0;       // ncnn threads per worker (0 = auto: cores / workers)
-    int cores = 0;                    // thread budget (0 = physical cores)
+    int batch = 8;                    // regions per run
+    int threads = 0;                  // CPU threads (0 = all cores)
     float overlap = 0.20f;
     float conf = 0.25f;
     float nms_iou = 0.45f;
@@ -83,61 +73,40 @@ struct Options {
 // Command line
 // ---------------------------------------------------------------------------
 
-// Thread budget: physical cores. ncnn's kernels share each core's vector units,
-// so hyperthreads add little and mostly cause contention.
-static int physical_cores() {
-    int n = 0;
-#if SAHI_NCNN
-    n = ncnn::get_physical_big_cpu_count();
-    if (n <= 0) n = ncnn::get_physical_cpu_count();
-#endif
-    if (n <= 0) n = static_cast<int>(std::thread::hardware_concurrency());
-    return std::max(1, n);
+static std::string join(const std::vector<std::string>& v, const char* sep) {
+    std::string s;
+    for (const auto& x : v) s += (s.empty() ? "" : sep) + x;
+    return s;
 }
 
 static void print_usage(const char* prog) {
     std::cerr
-#if SAHI_NCNN
-        << "Usage: " << prog << " <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]\n"
+        << "Usage: " << prog << " <model.onnx|model.mnn> <image|dir> [<image|dir> ...] [options]\n"
         << "\n"
-        << "Loads the YOLOv9 ncnn model (.param, then .bin) once and runs SAHI on every image given.\n"
-#else
-        << "Usage: " << prog << " <model.onnx> <image|dir> [<image|dir> ...] [options]\n"
-        << "\n"
-        << "Loads the YOLOv9 ONNX model once (ONNX Runtime, " SAHI_ORT_DEVICE ") and runs SAHI on every\n"
-        << "image given.\n"
-#endif
-        << "Directories are scanned for .jpg/.jpeg/.png/.bmp/.tif/.tiff/.webp files (sorted by name).\n"
+        << "Loads the YOLOv9 model once and runs SAHI on every image given. An .onnx model is\n"
+        << "converted to .mnn (next to it) on first use. Directories are scanned for\n"
+        << ".jpg/.jpeg/.png/.bmp/.tif/.tiff/.webp files (sorted by name).\n"
         << "\n"
         << "  -o, --output <path>    single image: output file (default: output.jpg)\n"
         << "                         several images: output directory (default: output/)\n"
         << "                         files are written as <name>_det.<ext>\n"
         << "      --csv <path>       also write all detections to a CSV file\n"
         << "  -n, --names <file>     class names, one per line: line 1 = class 0, line 2 = class 1, ...\n"
-#if SAHI_NCNN
-        << "                         (default: names from a metadata.yaml next to the .param, if present)\n"
-#else
         << "                         (default: names stored in the ONNX model, if present)\n"
-#endif
         << "  -r, --recursive        scan directories recursively\n"
-        << "  -s, --size <n>         model input size (default: from the model's metadata, else 640)\n"
+        << "\n"
+        << "  -d, --backend <b>      " << join(available_backends(), ", ") << " or auto (default: auto =\n"
+        << "                         the first available of those, in that order)\n"
+        << "      --precision <p>    normal, high or low (fp16 where supported) (default: normal)\n"
+        << "  -b, --batch <n>        regions per inference run (default: 8; 1 for fixed-batch models)\n"
+        << "  -t, --threads <n>      CPU backend threads and preprocessing (default: all cores)\n"
+        << "      --fp16             convert the .onnx with fp16 weights (smaller, faster on GPU)\n"
+        << "      --reconvert        convert the .onnx again even if the .mnn is up to date\n"
+        << "\n"
+        << "  -s, --size <n>         model input size (default: from the model, else 640)\n"
         << "      --slice <n>        slice size (default: model input size)\n"
         << "      --overlap <r>      slice overlap ratio (default: 0.20)\n"
         << "      --full             also detect on the whole image (finds large objects)\n"
-#if SAHI_NCNN
-        << "  -w, --workers <n>      slices run in parallel (default: one per core, never more than slices)\n"
-        << "  -t, --threads <n>      ncnn threads per slice (default: cores / workers)\n"
-        << "  -j, --cores <n>        total thread budget (default: physical CPU cores)\n"
-        << "      --gpu              use Vulkan (needs a build with -DSAHI_VULKAN=ON)\n"
-#else
-        << "  -b, --batch <n>        slices per inference run, for models exported with a dynamic\n"
-        << "                         batch size (default: 8; fixed-batch models use their batch)\n"
-#if SAHI_ORT_CUDA
-        << "      --device <n>       CUDA device index (default: 0)\n"
-#else
-        << "  -j, --cores <n>        ONNX Runtime threads (default: physical CPU cores)\n"
-#endif
-#endif
         << "      --conf <c>         confidence threshold (default: 0.25)\n"
         << "      --iou <i>          NMS IoU threshold within a slice (default: 0.45)\n"
         << "      --merge <m>        merging across slices: nmm = merge overlapping boxes into one (default),\n"
@@ -145,12 +114,15 @@ static void print_usage(const char* prog) {
         << "      --match <m>        overlap metric for the merge: ios = intersection over the smaller box\n"
         << "                         (default; joins objects cut by a slice edge), iou = intersection over union\n"
         << "      --match-thresh <t> overlap above which boxes are merged (default: 0.5)\n"
-        << "      --box <fmt>        box format in the model output: xyxy (LibreYOLO) or cxcywh\n"
-        << "                         (default: from the model's metadata, else detected from the output)\n"
-        << "      --pad <mode>       letterbox placement: center or topleft (LibreYOLO checkpoints)\n"
+        << "\n"
+        << "      --preprocess <p>   yolo (RGB, 0..1, OpenCV-style resize) or rtmdet (BGR, mmdet mean/std,\n"
+        << "                         Pillow-style resize) (default: from the model's metadata, else yolo)\n"
+        << "      --pad <mode>       letterbox placement: center or topleft (LibreYOLO-trained checkpoints)\n"
         << "                         (default: letterbox_pad from the model's metadata, else center)\n"
+        << "      --box <fmt>        box format in the model output: xyxy or cxcywh\n"
+        << "                         (default: from the model's metadata, else detected from the output)\n"
         << "      --in <name>        input name (default: the model's first input)\n"
-        << "      --out <name>       output name (default: the model's first output)\n";
+        << "      --out <name>       output name (default: the model's only output)\n";
 }
 
 static bool parse_args(int argc, char** argv, Options& opt) {
@@ -170,87 +142,62 @@ static bool parse_args(int argc, char** argv, Options& opt) {
         else if (a == "--csv")                    { if (!(v = next("--csv")))     return false; opt.csv_path = v; }
         else if (a == "-n" || a == "--names")     { if (!(v = next("--names")))   return false; opt.names_path = v; }
         else if (a == "-r" || a == "--recursive") { opt.recursive = true; }
+        else if (a == "-d" || a == "--backend")   { if (!(v = next("--backend"))) return false; opt.backend = v; }
+        else if (a == "--precision")              { if (!(v = next("--precision"))) return false; opt.precision = v; }
+        else if (a == "-b" || a == "--batch")     { if (!(v = next("--batch")))   return false; opt.batch = std::atoi(v); }
+        else if (a == "-t" || a == "--threads")   { if (!(v = next("--threads"))) return false; opt.threads = std::atoi(v); }
+        else if (a == "--fp16")                   { opt.fp16 = true; }
+        else if (a == "--reconvert")              { opt.reconvert = true; }
         else if (a == "-s" || a == "--size")      { if (!(v = next("--size")))    return false; opt.size = std::atoi(v); }
         else if (a == "--slice")                  { if (!(v = next("--slice")))   return false; opt.slice = std::atoi(v); }
         else if (a == "--overlap")                { if (!(v = next("--overlap"))) return false; opt.overlap = std::strtof(v, nullptr); }
         else if (a == "--full")                   { opt.full = true; }
+        else if (a == "--conf")                   { if (!(v = next("--conf")))    return false; opt.conf = std::strtof(v, nullptr); }
+        else if (a == "--iou")                    { if (!(v = next("--iou")))     return false; opt.nms_iou = std::strtof(v, nullptr); }
         else if (a == "--merge")                  { if (!(v = next("--merge")))   return false; opt.merge = v; }
         else if (a == "--match")                  { if (!(v = next("--match")))   return false; opt.match = v; }
         else if (a == "--match-thresh")           { if (!(v = next("--match-thresh"))) return false; opt.match_thresh = std::strtof(v, nullptr); }
-        else if (a == "-w" || a == "--workers")   { if (!(v = next("--workers"))) return false; opt.workers = std::atoi(v); }
-        else if (a == "-t" || a == "--threads")   { if (!(v = next("--threads"))) return false; opt.threads_per_worker = std::atoi(v); }
-        else if (a == "-j" || a == "--cores")     { if (!(v = next("--cores")))   return false; opt.cores = std::atoi(v); }
-        else if (a == "--gpu")                    { opt.gpu = true; }
-        else if (a == "-b" || a == "--batch")     { if (!(v = next("--batch")))   return false; opt.batch = std::atoi(v); }
-        else if (a == "--device")                 { if (!(v = next("--device")))  return false; opt.device = std::atoi(v); }
-        else if (a == "--conf")                   { if (!(v = next("--conf")))    return false; opt.conf = std::strtof(v, nullptr); }
-        else if (a == "--iou")                    { if (!(v = next("--iou")))     return false; opt.nms_iou = std::strtof(v, nullptr); }
-        else if (a == "--box")                    { if (!(v = next("--box")))     return false; opt.box = v; }
+        else if (a == "--preprocess")             { if (!(v = next("--preprocess"))) return false; opt.preprocess = v; }
         else if (a == "--pad")                    { if (!(v = next("--pad")))     return false; opt.pad = v; }
-        else if (a == "--in")                     { if (!(v = next("--in")))      return false; opt.in_blob = v; }
-        else if (a == "--out")                    { if (!(v = next("--out")))     return false; opt.out_blob = v; }
+        else if (a == "--box")                    { if (!(v = next("--box")))     return false; opt.box = v; }
+        else if (a == "--in")                     { if (!(v = next("--in")))      return false; opt.in_name = v; }
+        else if (a == "--out")                    { if (!(v = next("--out")))     return false; opt.out_name = v; }
         else if (!a.empty() && a[0] == '-')       { std::cerr << "Unknown option: " << a << "\n"; return false; }
         else positional.push_back(a);
     }
-    if (opt.size != 0 && opt.size < 32) {
-        std::cerr << "--size must be at least 32\n";
+    auto one_of = [](const std::string& v, std::initializer_list<const char*> allowed, const char* opt_name) {
+        for (const char* a : allowed) if (v == a) return true;
+        std::cerr << opt_name << ": unexpected value '" << v << "'\n";
+        return false;
+    };
+    std::vector<const char*> backends = {"auto"};
+    static std::vector<std::string> avail = available_backends();
+    for (const auto& b : avail) backends.push_back(b.c_str());
+    bool backend_ok = false;
+    for (const char* b : backends) backend_ok |= opt.backend == b;
+    if (!backend_ok) {
+        std::cerr << "--backend: '" << opt.backend << "' is not available in this build (available: auto, "
+                  << join(avail, ", ") << ")\n";
         return false;
     }
+    if (!one_of(opt.precision, {"normal", "high", "low"}, "--precision") ||
+        !one_of(opt.preprocess, {"auto", "rtmdet", "yolo"}, "--preprocess") ||
+        !one_of(opt.pad, {"auto", "center", "topleft"}, "--pad") ||
+        !one_of(opt.box, {"auto", "xyxy", "cxcywh"}, "--box") ||
+        !one_of(opt.merge, {"nmm", "nms"}, "--merge") || !one_of(opt.match, {"ios", "iou"}, "--match"))
+        return false;
+    if (opt.batch < 1) { std::cerr << "--batch must be at least 1\n"; return false; }
+    if (opt.size != 0 && opt.size < 32) { std::cerr << "--size must be at least 32\n"; return false; }
     if (opt.slice < 0) { std::cerr << "--slice must be positive\n"; return false; }
     if (opt.overlap < 0.0f || opt.overlap >= 1.0f) { std::cerr << "--overlap must be in [0, 1)\n"; return false; }
-    if (opt.merge != "nmm" && opt.merge != "nms") { std::cerr << "--merge must be nmm or nms\n"; return false; }
-    if (opt.match != "ios" && opt.match != "iou") { std::cerr << "--match must be ios or iou\n"; return false; }
-    if (opt.box != "auto" && opt.box != "xyxy" && opt.box != "cxcywh") { std::cerr << "--box must be xyxy or cxcywh\n"; return false; }
-    if (opt.pad != "auto" && opt.pad != "center" && opt.pad != "topleft") { std::cerr << "--pad must be center or topleft\n"; return false; }
-    if (opt.batch < 1) { std::cerr << "--batch must be at least 1\n"; return false; }
-    auto has_ext = [](const std::string& f, const char* ext) {
-        std::string e = fs::path(f).extension().string();
-        std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return e == ext;
-    };
-#if SAHI_ORT
-    // Fixed order: <model.onnx> <image|dir> ...
     if (positional.size() < 2) {
-        std::cerr << "Expected <model.onnx> and at least one image or directory\n";
+        if (!positional.empty()) std::cerr << "Expected the model and at least one image or directory\n";
         return false;
     }
-    if (!has_ext(positional[0], ".onnx")) {
-        std::cerr << "First argument must be the .onnx model (got " << positional[0]
-                  << "); this build uses ONNX Runtime, configure with -DSAHI_BACKEND=NCNN for .param/.bin\n";
-        return false;
-    }
-    opt.onnx = positional[0];
+    opt.model = positional[0];
     opt.inputs.assign(positional.begin() + 1, positional.end());
     return true;
-#else
-    // Fixed order: <model.param> <model.bin> <image|dir> ...
-    if (positional.size() < 3) {
-        std::cerr << "Expected <model.param> <model.bin> and at least one image or directory\n";
-        return false;
-    }
-    if (!has_ext(positional[0], ".param")) {
-        std::cerr << "First argument must be the model's .param file (got " << positional[0] << ")\n";
-        return false;
-    }
-    if (!has_ext(positional[1], ".bin")) {
-        std::cerr << "Second argument must be the model's .bin file (got " << positional[1] << ")\n";
-        return false;
-    }
-    opt.param = positional[0];
-    opt.bin = positional[1];
-    opt.inputs.assign(positional.begin() + 2, positional.end());
-    return true;
-#endif
 }
-
-#if SAHI_NCNN
-static bool check_model_files(const fs::path& param, const fs::path& bin) {
-    std::error_code ec;
-    if (!fs::is_regular_file(param, ec)) { std::cerr << "Model file not found: " << param << "\n"; return false; }
-    if (!fs::is_regular_file(bin, ec))   { std::cerr << "Weights file not found: " << bin << "\n"; return false; }
-    return true;
-}
-#endif
 
 static bool is_image_file(const fs::path& p) {
     std::string ext = p.extension().string();
@@ -308,73 +255,6 @@ static bool load_class_names(const std::string& path, std::vector<std::string>& 
     return true;
 }
 
-#if SAHI_NCNN
-// What a metadata.yaml next to the .param can tell us. Exporters such as
-// LibreYOLO write one with the class names, input size and letterbox placement.
-struct ModelMetadata {
-    std::vector<std::string> names;
-    int imgsz = 0;
-    std::string letterbox_pad;  // "center" / "topleft" (LibreYOLO)
-    std::string model_family;   // e.g. "yolo9", "yolo9_e2e" (LibreYOLO)
-    bool libreyolo = false;     // written by LibreYOLO (boxes are xyxy)
-};
-
-// Minimal reader for that file: flat "key: value" lines plus the `names`
-// mapping (0: person / '0': person) and `imgsz` (640, [640, 640] or a list).
-static ModelMetadata read_model_metadata(const fs::path& path) {
-    ModelMetadata md;
-    std::ifstream f(path);
-    if (!f) return md;
-    auto trim = [](std::string t) {
-        const auto b = t.find_first_not_of(" \t\r");
-        const auto e = t.find_last_not_of(" \t\r");
-        return b == std::string::npos ? std::string() : t.substr(b, e - b + 1);
-    };
-    auto unquote = [](std::string t) {
-        if (t.size() >= 2 && (t.front() == '\'' || t.front() == '"') && t.back() == t.front()) t = t.substr(1, t.size() - 2);
-        return t;
-    };
-    std::map<int, std::string> by_id;
-    std::string section, line;
-    while (std::getline(f, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (trim(line).empty() || trim(line)[0] == '#') continue;
-        const bool indented = line[0] == ' ' || line[0] == '\t' || line[0] == '-';
-        const std::string t = trim(line);
-        if (!indented) {
-            const auto colon = t.find(':');
-            section = colon == std::string::npos ? "" : unquote(trim(t.substr(0, colon)));
-            const std::string rest = colon == std::string::npos ? "" : unquote(trim(t.substr(colon + 1)));
-            if (section == "imgsz" && !rest.empty()) {  // imgsz: 640 or imgsz: [640, 640]
-                const auto d = rest.find_first_of("0123456789");
-                if (d != std::string::npos) md.imgsz = std::atoi(rest.c_str() + d);
-            } else if (section == "letterbox_pad") {
-                md.letterbox_pad = rest;
-            } else if (section == "model_family") {
-                md.model_family = rest;
-            } else if (section == "libreyolo_version") {
-                md.libreyolo = true;
-            }
-            continue;
-        }
-        if (section == "imgsz" && t[0] == '-' && md.imgsz == 0) {  // block list: "- 640"
-            md.imgsz = std::atoi(trim(t.substr(1)).c_str());
-        } else if (section == "names") {
-            const auto colon = t.find(':');
-            if (colon == std::string::npos) continue;
-            const std::string key = unquote(trim(t.substr(0, colon)));
-            if (key.empty() || key.find_first_not_of("0123456789") != std::string::npos) continue;
-            by_id[std::atoi(key.c_str())] = unquote(trim(t.substr(colon + 1)));
-        }
-    }
-    if (!by_id.empty()) {
-        md.names.assign(static_cast<size_t>(by_id.rbegin()->first) + 1, std::string());
-        for (const auto& kv : by_id) md.names[kv.first] = kv.second;
-    }
-    return md;
-}
-#endif  // SAHI_NCNN
-
 static std::string class_label(const std::vector<std::string>& names, int id) {
     if (id >= 0 && static_cast<size_t>(id) < names.size() && !names[id].empty()) return names[id];
     return "class " + std::to_string(id);
@@ -388,10 +268,75 @@ static std::string csv_escape(const std::string& s) {
 }
 
 // ---------------------------------------------------------------------------
+// Model: .onnx -> .mnn conversion
+// ---------------------------------------------------------------------------
+
+static std::string lower_ext(const fs::path& p) {
+    std::string e = p.extension().string();
+    std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return e;
+}
+
+// MNN's converter: built next to this program by CMake (YOLOV9_MNNCONVERT),
+// else next to the executable, else on PATH.
+static std::string find_converter(const char* argv0) {
+    std::error_code ec;
+#ifdef YOLOV9_MNNCONVERT
+    if (fs::is_regular_file(YOLOV9_MNNCONVERT, ec)) return YOLOV9_MNNCONVERT;
+#endif
+    const fs::path here = fs::absolute(argv0, ec).parent_path() / "MNNConvert";
+    if (fs::is_regular_file(here, ec)) return here.string();
+    return "MNNConvert";
+}
+
+static std::string shell_quote(const std::string& s) {
+    std::string q = "'";
+    for (char c : s) {
+        if (c == '\'') q += "'\\''";
+        else q += c;
+    }
+    return q + "'";
+}
+
+// Converted model for an .onnx: <stem>.mnn (or <stem>.fp16.mnn) next to it,
+// converted again when missing, older than the .onnx, or with --reconvert.
+static bool ensure_mnn(const fs::path& onnx, const Options& opt, const char* argv0, fs::path& mnn) {
+    mnn = onnx;
+    mnn.replace_extension(opt.fp16 ? ".fp16.mnn" : ".mnn");
+    std::error_code ec;
+    if (!opt.reconvert && fs::is_regular_file(mnn, ec) &&
+        fs::last_write_time(mnn, ec) >= fs::last_write_time(onnx, ec))
+        return true;
+    const std::string conv = find_converter(argv0);
+    const fs::path log = fs::path(mnn.string() + ".convert.log");
+    std::string cmd = shell_quote(conv) + " -f ONNX --modelFile " + shell_quote(onnx.string()) + " --MNNModel " +
+                      shell_quote(mnn.string()) + " --bizCode YOLOv9";
+    if (opt.fp16) cmd += " --fp16";
+    cmd += " > " + shell_quote(log.string()) + " 2>&1";
+    std::cout << "Converting " << onnx.string() << " -> " << mnn.string() << (opt.fp16 ? " (fp16 weights)" : "")
+              << " ..." << std::endl;
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0 || !fs::is_regular_file(mnn, ec) || fs::file_size(mnn, ec) == 0) {
+        std::cerr << "Model conversion failed (" << conv << ", exit code " << rc << "). Converter output: "
+                  << log.string() << "\n";
+        std::ifstream lf(log);
+        std::string line, last;
+        int shown = 0;
+        while (std::getline(lf, line)) last += line + "\n", ++shown;
+        if (shown > 0) std::cerr << (last.size() > 2000 ? last.substr(last.size() - 2000) : last);
+        fs::remove(mnn, ec);
+        return false;
+    }
+    fs::remove(log, ec);
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
 // SAHI
 // ---------------------------------------------------------------------------
 
-// Generate overlapping SAHI tile coordinates
+// Generate overlapping SAHI slice coordinates
 static std::vector<Region> generate_slices(int img_w, int img_h, int slice_w, int slice_h, float overlap_ratio) {
     std::vector<Region> slices;
     int step_x = std::max(1, static_cast<int>(slice_w * (1.0f - overlap_ratio)));
@@ -476,263 +421,6 @@ static std::vector<Detection> merge_detections(const std::vector<Detection>& det
     return out;
 }
 
-#if SAHI_NCNN
-// ---------------------------------------------------------------------------
-// ncnn backend
-// ---------------------------------------------------------------------------
-
-struct ModelInfo {
-    std::string in_blob;
-    std::string out_blob;
-    int size = 640;
-    bool xyxy = false;     // output boxes are x1,y1,x2,y2 (else cx,cy,w,h)
-    bool topleft = false;  // letterbox image in the top-left corner (else centred)
-};
-
-// View the head output as (features x anchors). ncnn gives [4 + nc, N] as
-// h = 4 + nc, w = N; the transposed layout (anchors x features) is detected
-// automatically, since there are always far more anchors than features.
-struct HeadView {
-    ncnn::Mat out;
-    bool feature_rows = true;
-    int n_feat = 0, n_anchor = 0;
-    float at(int f, int a) const { return feature_rows ? out.row(f)[a] : out.row(a)[f]; }
-};
-
-static bool make_head_view(const ncnn::Mat& out_raw, HeadView& v) {
-    v.out = out_raw;
-    if (v.out.dims == 3 && v.out.c == 1) v.out = v.out.channel(0);
-    if (v.out.dims != 2) {
-        std::fprintf(stderr, "Unexpected output shape (dims=%d, w=%d, h=%d, c=%d); expected 2D (4+classes) x anchors\n",
-                     v.out.dims, v.out.w, v.out.h, v.out.c);
-        return false;
-    }
-    v.feature_rows = v.out.h <= v.out.w;
-    v.n_feat = v.feature_rows ? v.out.h : v.out.w;
-    v.n_anchor = v.feature_rows ? v.out.w : v.out.h;
-    if (v.n_feat < 5) {
-        std::fprintf(stderr, "Output has %d features per anchor; expected 4 box values + class scores\n", v.n_feat);
-        return false;
-    }
-    return true;
-}
-
-// Corner boxes always satisfy x2 >= x1 and y2 >= y1. With centre boxes, many
-// anchors have a centre further from the origin than the box is wide, so the
-// same test fails somewhere among the thousands of anchors.
-static bool looks_like_xyxy(const HeadView& v) {
-    for (int a = 0; a < v.n_anchor; ++a) {
-        if (v.at(2, a) < v.at(0, a) || v.at(3, a) < v.at(1, a)) return false;
-    }
-    return true;
-}
-
-// Decode a YOLOv9-style head: (4 + num_classes) x num_anchors. Rows are the
-// box (x1,y1,x2,y2 or cx,cy,w,h, in letterboxed input pixels), then one
-// sigmoid-activated score per class.
-static bool decode_yolo(const ncnn::Mat& out_raw, bool xyxy, float conf, float scale, int pad_l, int pad_t,
-                        const Region& r, std::vector<Detection>& dets) {
-    HeadView v;
-    if (!make_head_view(out_raw, v)) return false;
-    const int n_cls = v.n_feat - 4;
-    auto at = [&](int f, int a) { return v.at(f, a); };
-
-    // Best class per anchor. In the usual (features x anchors) layout each class
-    // is one contiguous row, so scan row by row (sequential memory, vectorizes)
-    // instead of jumping a whole row per class for every anchor.
-    std::vector<float> best_score(v.n_anchor);
-    std::vector<int> best_cls(v.n_anchor, 0);
-    if (v.feature_rows) {
-        const float* row = v.out.row(4);
-        std::copy(row, row + v.n_anchor, best_score.begin());
-        for (int c = 1; c < n_cls; ++c) {
-            row = v.out.row(4 + c);
-            for (int a = 0; a < v.n_anchor; ++a) {
-                if (row[a] > best_score[a]) { best_score[a] = row[a]; best_cls[a] = c; }
-            }
-        }
-    } else {
-        for (int a = 0; a < v.n_anchor; ++a) {
-            const float* p = v.out.row(a) + 4;
-            int best = 0;
-            for (int c = 1; c < n_cls; ++c) if (p[c] > p[best]) best = c;
-            best_score[a] = p[best];
-            best_cls[a] = best;
-        }
-    }
-
-    for (int a = 0; a < v.n_anchor; ++a) {
-        if (best_score[a] < conf) continue;
-        float bx1, by1, bx2, by2;
-        if (xyxy) {
-            bx1 = at(0, a); by1 = at(1, a); bx2 = at(2, a); by2 = at(3, a);
-        } else {
-            const float cx = at(0, a), cy = at(1, a), w = at(2, a), h = at(3, a);
-            bx1 = cx - 0.5f * w; by1 = cy - 0.5f * h; bx2 = cx + 0.5f * w; by2 = cy + 0.5f * h;
-        }
-        // Undo the letterbox, clamp to the region, then shift to image coordinates
-        float x1 = std::clamp((bx1 - pad_l) / scale, 0.0f, static_cast<float>(r.width));
-        float y1 = std::clamp((by1 - pad_t) / scale, 0.0f, static_cast<float>(r.height));
-        float x2 = std::clamp((bx2 - pad_l) / scale, 0.0f, static_cast<float>(r.width));
-        float y2 = std::clamp((by2 - pad_t) / scale, 0.0f, static_cast<float>(r.height));
-        if (x2 - x1 < 1.0f || y2 - y1 < 1.0f) continue;
-
-        Detection d;
-        d.box = cv::Rect2f(x1 + r.x, y1 + r.y, x2 - x1, y2 - y1);
-        d.confidence = best_score[a];
-        d.class_id = best_cls[a];
-        dets.push_back(d);
-    }
-    return true;
-}
-
-// Letterbox one region of the image to size x size (gray 114 padding, centred or top-left),
-// run YOLOv9 and return its detections (after per-region NMS) in image coordinates.
-// Uses its own Extractor, so it is safe to call concurrently on the same Net.
-// Per-worker memory pools, reused for every tile and image. By default all
-// extractors share the network's one locked pool, so concurrent tiles would
-// queue on its mutex; this is the setup ncnn's own benchmark uses.
-struct WorkerPools {
-    ncnn::UnlockedPoolAllocator blob;
-    ncnn::PoolAllocator workspace;
-    WorkerPools() {
-        blob.set_size_compare_ratio(0.f);
-        workspace.set_size_compare_ratio(0.f);
-    }
-};
-
-static bool detect_region(const ncnn::Net& net, const ModelInfo& mi, const cv::Mat& bgr,
-                          const Region& r, float conf, float nms_iou, WorkerPools* pools,
-                          std::vector<Detection>& out) {
-    const int S = mi.size;
-    const float scale = std::min(static_cast<float>(S) / r.width, static_cast<float>(S) / r.height);
-    const int nw = std::min(S, std::max(1, static_cast<int>(r.width * scale)));
-    const int nh = std::min(S, std::max(1, static_cast<int>(r.height * scale)));
-    const int pad_l = mi.topleft ? 0 : (S - nw) / 2;
-    const int pad_t = mi.topleft ? 0 : (S - nh) / 2;
-
-    // Read the region straight from the BGR image (row stride = full image row), convert to RGB
-    const unsigned char* src = bgr.ptr<unsigned char>(r.y) + static_cast<size_t>(r.x) * 3;
-    ncnn::Mat resized = ncnn::Mat::from_pixels_resize(src, ncnn::Mat::PIXEL_BGR2RGB, r.width, r.height,
-                                                      static_cast<int>(bgr.step[0]), nw, nh);
-    ncnn::Mat in;
-    ncnn::copy_make_border(resized, in, pad_t, S - nh - pad_t, pad_l, S - nw - pad_l,
-                           ncnn::BORDER_CONSTANT, 114.0f);
-    const float norm[3] = {1 / 255.0f, 1 / 255.0f, 1 / 255.0f};
-    in.substract_mean_normalize(nullptr, norm);
-
-    ncnn::Extractor ex = net.create_extractor();
-    if (pools) {
-        ex.set_blob_allocator(&pools->blob);
-        ex.set_workspace_allocator(&pools->workspace);
-    }
-    if (ex.input(mi.in_blob.c_str(), in) != 0) {
-        std::fprintf(stderr, "Cannot feed input blob '%s'\n", mi.in_blob.c_str());
-        return false;
-    }
-    ncnn::Mat raw;
-    if (ex.extract(mi.out_blob.c_str(), raw) != 0) {
-        std::fprintf(stderr, "Inference failed on region (%d,%d %dx%d)\n", r.x, r.y, r.width, r.height);
-        return false;
-    }
-
-    std::vector<Detection> dets;
-    if (!decode_yolo(raw, mi.xyxy, conf, scale, pad_l, pad_t, r, dets)) return false;
-
-    // The head predicts many overlapping boxes per object: suppress within the region first
-    std::vector<Detection> kept = apply_class_aware_nms(dets, conf, nms_iou);
-    out.insert(out.end(), kept.begin(), kept.end());
-    return true;
-}
-
-// How the thread budget is spread over the tiles. ncnn's convolution layers
-// fix their thread count when the model is loaded (weights are pre-arranged
-// for it), so the split is chosen once at startup, not per image.
-struct ThreadPlan {
-    int workers = 1;   // tiles in flight at once (outer OpenMP)
-    int threads = 1;   // ncnn threads per tile (inner OpenMP)
-};
-
-// Default: one tile per core with ncnn single-threaded. Tiling produces many
-// equal tiles, and this scales almost linearly with no nested OpenMP teams and
-// no idle spin-waiting; ncnn's per-layer threading scales worse on one small
-// 640x640 tile. -w / -t override.
-static ThreadPlan plan_threads(int cores, const Options& opt) {
-    ThreadPlan p;
-    p.workers = opt.workers > 0 ? opt.workers : cores;
-    p.threads = opt.threads_per_worker > 0 ? opt.threads_per_worker : std::max(1, cores / p.workers);
-#ifndef _OPENMP
-    p.workers = 1;
-#endif
-    return p;
-}
-
-// Tiles in parallel with OpenMP, one Extractor per tile on a shared Net. An
-// image that is a single tile runs on `wide` (all cores in one extraction)
-// when the tile plan would leave cores idle; it is loaded on first use.
-class NcnnDetector : public TileDetector {
-public:
-    NcnnDetector(std::unique_ptr<ncnn::Net> net, std::function<std::unique_ptr<ncnn::Net>()> load_wide,
-                 const ModelInfo& mi, const ThreadPlan& plan, bool use_pools)
-        : net_(std::move(net)), load_wide_(std::move(load_wide)), mi_(mi), plan_(plan), use_pools_(use_pools) {
-        for (int w = 0; w < std::max(1, plan.workers); ++w) pools_.push_back(std::make_unique<WorkerPools>());
-    }
-
-    void prepare(size_t n_tiles) override {
-        if (n_tiles == 1 && load_wide_ && !wide_tried_) {
-            wide_tried_ = true;
-            wide_ = load_wide_();
-        }
-    }
-
-    int detect(const cv::Mat& work, const std::vector<Region>& tiles, float conf, float nms_iou,
-               std::vector<std::vector<Detection>>& per_tile) override {
-        per_tile.assign(tiles.size(), {});
-        int n_failed = 0;
-        if (tiles.size() == 1 && wide_) {
-            used_ = {1, wide_->opt.num_threads};
-            if (!detect_region(*wide_, mi_, work, tiles[0], conf, nms_iou, use_pools_ ? pools_[0].get() : nullptr,
-                               per_tile[0]))
-                ++n_failed;
-            return n_failed;
-        }
-        const int n_workers = std::max(1, std::min<int>(plan_.workers, static_cast<int>(tiles.size())));
-        used_ = {n_workers, plan_.threads};
-        (void)n_workers;  // unused without OpenMP
-
-        #pragma omp parallel for num_threads(n_workers) schedule(dynamic, 1) reduction(+ : n_failed)
-        for (int i = 0; i < static_cast<int>(tiles.size()); ++i) {
-#ifdef _OPENMP
-            WorkerPools* wp = use_pools_ ? pools_[omp_get_thread_num()].get() : nullptr;
-#else
-            WorkerPools* wp = use_pools_ ? pools_[0].get() : nullptr;
-#endif
-            if (!detect_region(*net_, mi_, work, tiles[i], conf, nms_iou, wp, per_tile[i])) ++n_failed;
-        }
-        return n_failed;
-    }
-
-    std::string last_run_desc() const override {
-        return std::to_string(used_.workers) + " x " + std::to_string(used_.threads) + " thr";
-    }
-
-private:
-    std::unique_ptr<ncnn::Net> net_;
-    std::function<std::unique_ptr<ncnn::Net>()> load_wide_;
-    std::unique_ptr<ncnn::Net> wide_;
-    bool wide_tried_ = false;
-    ModelInfo mi_;
-    ThreadPlan plan_;
-    bool use_pools_;
-    std::vector<std::unique_ptr<WorkerPools>> pools_;
-    ThreadPlan used_;
-};
-#endif  // SAHI_NCNN
-
-// ---------------------------------------------------------------------------
-// SAHI detection (shared by the backends)
-// ---------------------------------------------------------------------------
-
 // SAHI regions of one image: overlapping slices, plus the whole image with
 // --full (skipped when one slice already covers everything).
 static std::vector<Region> sahi_regions(int img_w, int img_h, int slice_size, const Options& opt) {
@@ -741,19 +429,6 @@ static std::vector<Region> sahi_regions(int img_w, int img_h, int slice_size, co
         regions.push_back({0, 0, img_w, img_h});
     }
     return regions;
-}
-
-// Detect on all regions of one image and merge. Results are concatenated in
-// region order, so the output does not depend on thread scheduling.
-static std::vector<Detection> run_sahi(TileDetector& det, const cv::Mat& bgr, const std::vector<Region>& regions,
-                                       const Options& opt, size_t& n_raw, int& failed) {
-    std::vector<std::vector<Detection>> per_region;
-    failed = det.detect(bgr, regions, opt.conf, opt.nms_iou, per_region);
-    std::vector<Detection> all;
-    for (auto& v : per_region) all.insert(all.end(), v.begin(), v.end());
-    n_raw = all.size();
-    // Merge duplicates and fragments across slice borders
-    return merge_detections(all, opt);
 }
 
 // Draw boxes with "<class name> <score>" labels on a green background
@@ -804,6 +479,11 @@ int main(int argc, char** argv) {
 
     using clock = std::chrono::steady_clock;
     const auto t0 = clock::now();
+    const int cores = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    const int threads = opt.threads > 0 ? opt.threads : cores;
+#ifdef _OPENMP
+    omp_set_num_threads(threads);  // preprocessing and decoding
+#endif
 
     std::vector<std::string> class_names;
     std::string names_source;
@@ -813,6 +493,95 @@ int main(int argc, char** argv) {
             return 1;
         }
         names_source = opt.names_path;
+    }
+
+    // ---- Model: .onnx (MNN: converted to .mnn on first use) or .mnn ----
+    std::error_code ec;
+    const fs::path model_path(opt.model);
+    if (!fs::is_regular_file(model_path, ec)) {
+        std::cerr << "Model file not found: " << opt.model << "\n";
+        return 1;
+    }
+    fs::path onnx_path, mnn_path;
+    const std::string ext = lower_ext(model_path);
+    if (ext == ".onnx") {
+        onnx_path = model_path;
+        if (!ensure_mnn(onnx_path, opt, argv[0], mnn_path)) return 1;
+    } else if (ext == ".mnn") {
+        mnn_path = model_path;
+        // Metadata from an .onnx of the same name, if there is one
+        fs::path guess = model_path;
+        std::string stem = guess.stem().string();
+        if (stem.size() > 5 && stem.compare(stem.size() - 5, 5, ".fp16") == 0) stem.resize(stem.size() - 5);
+        guess = model_path.parent_path() / (stem + ".onnx");
+        if (fs::is_regular_file(guess, ec)) onnx_path = guess;
+    } else {
+        std::cerr << "The model must be an .onnx or .mnn file (got " << opt.model << ")\n";
+        return 1;
+    }
+
+    // ONNX metadata (LibreYOLO writes names, imgsz, model_family, letterbox_pad)
+    OnnxInfo onnx;
+    if (!onnx_path.empty()) {
+        std::string err;
+        if (!read_onnx_info(onnx_path.string(), onnx, err)) {
+            std::cerr << "Warning: cannot read " << onnx_path.string() << ": " << err << "\n";
+        }
+    }
+    auto meta = [&](const char* key) {
+        auto it = onnx.metadata.find(key);
+        return it == onnx.metadata.end() ? std::string() : it->second;
+    };
+    const std::string family = meta("model_family");
+    const bool libreyolo = !meta("libreyolo_version").empty();
+    if (names_source.empty()) {
+        std::vector<std::string> n = parse_names_json(meta("names"));
+        if (!n.empty()) {
+            class_names = n;
+            names_source = "model metadata";
+        }
+    }
+
+    // Input size: --size, metadata, the ONNX input shape, else 640
+    int size = opt.size;
+    if (size == 0) size = std::atoi(meta("imgsz").c_str());
+    if (size < 32 && !onnx.input_dims.empty() && onnx.input_dims[0].size() == 4 && onnx.input_dims[0][2].value > 0)
+        size = static_cast<int>(onnx.input_dims[0][2].value);
+    if (size < 32) size = 640;
+
+    // Preprocessing and letterbox placement
+    std::string prep = opt.preprocess, prep_source = "--preprocess";
+    if (prep == "auto") {
+        if (family.rfind("rtmdet", 0) == 0) { prep = "rtmdet"; prep_source = "metadata"; }
+        else if (family.rfind("yolo", 0) == 0) { prep = "yolo"; prep_source = "metadata"; }
+        else { prep = "yolo"; prep_source = "default"; }
+    }
+    std::string pad = opt.pad, pad_source = "--pad";
+    if (pad == "auto") {
+        const std::string mp = meta("letterbox_pad");
+        if (mp == "topleft" || mp == "center" || mp == "centre") { pad = mp == "topleft" ? "topleft" : "center"; pad_source = "metadata"; }
+        else { pad = prep == "rtmdet" ? "topleft" : "center"; pad_source = "default"; }
+    }
+
+    EngineConfig cfg;
+    cfg.model_path = mnn_path.string();
+    cfg.backend = opt.backend;
+    cfg.precision = opt.precision;
+    cfg.threads = threads;
+    cfg.batch = opt.batch;
+    cfg.size = size;
+    cfg.norm = prep == "rtmdet" ? InputNorm::rtmdet() : InputNorm::yolo();
+    cfg.topleft = pad == "topleft";
+    cfg.box = opt.box;
+    cfg.box_from_metadata = libreyolo;  // LibreYOLO's YOLOv9 head exports x1,y1,x2,y2
+    cfg.in_name = opt.in_name;
+    cfg.out_name = opt.out_name;
+    DetectorInfo info;
+    std::string error;
+    std::unique_ptr<RegionDetector> detector = RegionDetector::create(cfg, info, error);
+    if (!detector) {
+        std::cerr << "Failed to set up " << mnn_path.string() << ": " << error << "\n";
+        return 1;
     }
 
     std::vector<fs::path> images = collect_images(opt.inputs, opt.recursive);
@@ -829,7 +598,6 @@ int main(int argc, char** argv) {
         if (fs::is_directory(out_file)) out_file /= images[0].stem().string() + "_det" + images[0].extension().string();
     } else {
         out_dir = opt.output.empty() ? fs::path("output") : fs::path(opt.output);
-        std::error_code ec;
         fs::create_directories(out_dir, ec);
         if (ec) {
             std::cerr << "Cannot create output directory " << out_dir << ": " << ec.message() << "\n";
@@ -842,189 +610,22 @@ int main(int argc, char** argv) {
     auto output_for = [&](const fs::path& in) -> fs::path {
         if (single) return out_file;
         std::string base = in.stem().string() + "_det";
-        std::string ext = in.extension().string();
-        int& n = used_names[base + ext];
-        std::string name = (++n == 1) ? base + ext : base + "_" + std::to_string(n) + ext;
+        std::string e = in.extension().string();
+        int& n = used_names[base + e];
+        std::string name = (++n == 1) ? base + e : base + "_" + std::to_string(n) + e;
         return out_dir / name;
     };
 
-    const int cores = opt.cores > 0 ? opt.cores : physical_cores();
-    std::unique_ptr<TileDetector> detector;
-    std::string model_line;  // startup summary of the model and how it runs
-    int tile_size = 0;
-
-#if SAHI_ORT
-    // ---- ONNX Runtime: one session; tiles run in batches ----
-    {
-        OrtConfig cfg;
-        cfg.model_path = opt.onnx;
-        cfg.size = opt.size;
-        cfg.batch = opt.batch;
-        cfg.device = opt.device;
-        cfg.threads = cores;
-        cfg.box = opt.box;
-        cfg.pad = opt.pad;
-        cfg.in_name = opt.in_blob;
-        cfg.out_name = opt.out_blob;
-        std::error_code ec;
-        if (!fs::is_regular_file(cfg.model_path, ec)) {
-            std::cerr << "Model file not found: " << cfg.model_path << "\n";
-            return 1;
-        }
-        OrtModelInfo info;
-        std::string error;
-        detector = create_ort_detector(cfg, info, error);
-        if (!detector) {
-            std::cerr << "Failed to load " << cfg.model_path << ": " << error << "\n";
-            return 1;
-        }
-        tile_size = info.size;
-        if (names_source.empty() && !info.names.empty()) {
-            class_names = info.names;
-            names_source = "model metadata";
-        }
-        model_line = "Model: " + cfg.model_path + " (" + info.in_name + " -> " + info.out_name + ", input " +
-                     std::to_string(info.size) + "x" + std::to_string(info.size) + ", boxes " +
-                     (info.xyxy ? "xyxy" : "cxcywh") + " (" + info.box_source + "), pad " +
-                     (info.topleft ? "topleft" : "center") + " (" + info.pad_source + ")) | " + info.device +
-                     " | batch " + std::to_string(info.batch) + (info.dynamic_batch ? "" : " (fixed by the model)");
-    }
-#else
-    // ---- ncnn: one Net shared by all workers; each tile gets its own Extractor ----
-    {
-        const fs::path param_path(opt.param), bin_path(opt.bin);
-        if (!check_model_files(param_path, bin_path)) return 1;
-
-        // Class names, input size, box format and letterbox placement: command-line
-        // options win; otherwise a metadata.yaml next to the .param; otherwise defaults.
-        const fs::path meta_path = param_path.parent_path() / "metadata.yaml";
-        const ModelMetadata md = read_model_metadata(meta_path);
-        if (names_source.empty() && !md.names.empty()) {
-            class_names = md.names;
-            names_source = meta_path.string();
-        }
-        if (opt.size == 0) opt.size = md.imgsz >= 32 ? md.imgsz : 640;
-
-        const ThreadPlan plan = plan_threads(cores, opt);
-
-        bool use_gpu = false;
-        std::string device = "CPU";
-        if (opt.gpu) {
-#if NCNN_VULKAN
-            if (ncnn::get_gpu_count() > 0) {
-                use_gpu = true;
-                device = std::string("Vulkan (") + ncnn::get_gpu_info(0).device_name() + ")";
-            } else {
-                std::cerr << "Warning: no Vulkan device found; using CPU\n";
-            }
-#else
-            std::cerr << "Warning: built without Vulkan (configure with -DSAHI_VULKAN=ON); using CPU\n";
-#endif
-        }
-
-        auto load_net = [=](int threads, bool concurrent) -> std::unique_ptr<ncnn::Net> {
-            auto n = std::make_unique<ncnn::Net>();
-            n->opt.num_threads = threads;
-            n->opt.lightmode = true;  // free intermediate blobs as soon as possible
-            n->opt.use_vulkan_compute = use_gpu;
-            // With several tiles in flight, idle ncnn threads must not spin-wait
-            // for work (default 20 ms): they would burn cores other tiles need.
-            n->opt.openmp_blocktime = concurrent ? 0 : 20;
-            if (n->load_param(param_path.string().c_str()) != 0) {
-                std::cerr << "Failed to load " << param_path << "\n";
-                return nullptr;
-            }
-            if (n->load_model(bin_path.string().c_str()) != 0) {
-                std::cerr << "Failed to load " << bin_path << "\n";
-                return nullptr;
-            }
-            return n;
-        };
-
-        std::unique_ptr<ncnn::Net> net = load_net(plan.threads, plan.workers > 1);
-        if (!net) return 1;
-
-#ifdef _OPENMP
-        // Nested OpenMP only when both levels have threads to use.
-        omp_set_max_active_levels(plan.workers > 1 && plan.threads > 1 ? 2 : 1);
-#endif
-
-        ModelInfo mi;
-        mi.size = opt.size;
-        std::string pad_source = "default";
-        if (opt.pad != "auto") {
-            mi.topleft = opt.pad == "topleft";
-            pad_source = "--pad";
-        } else if (md.letterbox_pad == "topleft" || md.letterbox_pad == "center" || md.letterbox_pad == "centre") {
-            mi.topleft = md.letterbox_pad == "topleft";
-            pad_source = "metadata.yaml";
-        }
-        mi.in_blob = opt.in_blob;
-        mi.out_blob = opt.out_blob;
-        if (mi.in_blob.empty()) {
-            if (net->input_names().empty()) { std::cerr << "Model has no input blob; pass --in\n"; return 1; }
-            mi.in_blob = net->input_names()[0];
-        }
-        if (mi.out_blob.empty()) {
-            if (net->output_names().empty()) { std::cerr << "Model has no output blob; pass --out\n"; return 1; }
-            mi.out_blob = net->output_names()[0];
-        }
-
-        // Check the blob names and output layout once, on a blank input, so a wrong
-        // --in/--out or an unsupported model fails here instead of on every tile.
-        // The same output tells us the box format when nothing else does.
-        std::string box_source;
-        {
-            ncnn::Mat probe(mi.size, mi.size, 3);
-            probe.fill(0.5f);
-            ncnn::Extractor ex = net->create_extractor();
-            ncnn::Mat out;
-            if (ex.input(mi.in_blob.c_str(), probe) != 0 || ex.extract(mi.out_blob.c_str(), out) != 0) {
-                std::cerr << "Cannot run the model with input '" << mi.in_blob << "' and output '" << mi.out_blob
-                          << "'. Model inputs:";
-                for (const char* n : net->input_names()) std::cerr << ' ' << n;
-                std::cerr << " | outputs:";
-                for (const char* n : net->output_names()) std::cerr << ' ' << n;
-                std::cerr << "\nPass the right names with --in / --out.\n";
-                return 1;
-            }
-            HeadView v;
-            if (!make_head_view(out, v)) return 1;
-            if (opt.box != "auto") {
-                mi.xyxy = opt.box == "xyxy";
-                box_source = "--box";
-            } else if (md.libreyolo && md.model_family.rfind("yolo9", 0) == 0) {
-                mi.xyxy = true;  // LibreYOLO's YOLOv9 head exports xyxy boxes
-                box_source = "metadata.yaml";
-            } else {
-                mi.xyxy = looks_like_xyxy(v);
-                box_source = "detected";
-            }
-        }
-
-        // Images that fit in one tile get no tile parallelism; when the tile plan
-        // leaves cores idle, those run on a second copy of the model with all cores.
-        std::function<std::unique_ptr<ncnn::Net>()> load_wide;
-        if (!use_gpu && plan.threads < cores) load_wide = [=]() { return load_net(cores, false); };
-
-        tile_size = mi.size;
-        model_line = "Model: " + param_path.string() + " + " + bin_path.filename().string() + " (" + mi.in_blob +
-                     " -> " + mi.out_blob + ", input " + std::to_string(mi.size) + "x" + std::to_string(mi.size) +
-                     ", boxes " + (mi.xyxy ? "xyxy" : "cxcywh") + " (" + box_source + "), pad " +
-                     (mi.topleft ? "topleft" : "center") + " (" + pad_source + ")) | " + device + " | " +
-                     std::to_string(cores) + " cores: " + std::to_string(plan.workers) + " tile(s) in parallel x " +
-                     std::to_string(plan.threads) + " thread(s)"
-#ifndef _OPENMP
-                     + " [built without OpenMP: tiles run sequentially]"
-#endif
-            ;
-        detector = std::make_unique<NcnnDetector>(std::move(net), load_wide, mi, plan, !use_gpu);
-    }
-#endif
-
-    const int slice_size = opt.slice > 0 ? opt.slice : tile_size;
+    const int slice_size = opt.slice > 0 ? opt.slice : size;
     const double init_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-    std::cout << model_line << "\n"
+    std::cout << "Model: " << mnn_path.string() << (family.empty() ? "" : " (" + family + ")") << " | "
+              << info.in_name << " -> " << info.out_name << ", input " << size << "x" << size << ", "
+              << info.n_anchor << " anchors x " << (info.n_feat - 4) << " classes, boxes "
+              << (info.xyxy ? "xyxy" : "cxcywh") << " (" << info.box_source << ")\n"
+              << "Backend: " << engine_name() << ", " << info.backend << " | batch " << info.batch
+              << (info.batch < opt.batch ? " (the model has a fixed batch size)" : "") << " | precision "
+              << opt.precision << " | preprocessing " << prep << " (" << prep_source << "), pad " << pad << " ("
+              << pad_source << ")\n"
               << "Slices: " << slice_size << "x" << slice_size << ", overlap " << opt.overlap
               << (opt.full ? " + full image" : "") << " | merge " << opt.merge << "/" << opt.match << " > "
               << opt.match_thresh << " | " << images.size() << " image(s)";
@@ -1061,12 +662,14 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        size_t n_raw = 0;
-        int failed = 0;
-        const std::vector<Region> tiles = sahi_regions(bgr.cols, bgr.rows, slice_size, opt);
-        detector->prepare(tiles.size());  // may load something on first use: not timed
+        const std::vector<Region> regions = sahi_regions(bgr.cols, bgr.rows, slice_size, opt);
         const auto ti = clock::now();
-        std::vector<Detection> merged = run_sahi(*detector, bgr, tiles, opt, n_raw, failed);
+        std::vector<std::vector<Detection>> per_region;
+        const int failed = detector->detect(bgr, regions, opt.conf, opt.nms_iou, per_region);
+        std::vector<Detection> all;
+        for (auto& v : per_region) all.insert(all.end(), v.begin(), v.end());
+        // Merge duplicates and fragments across slice borders
+        std::vector<Detection> merged = merge_detections(all, opt);
         const double infer_ms = std::chrono::duration<double, std::milli>(clock::now() - ti).count();
 
         if (!class_names.empty()) {
@@ -1100,12 +703,12 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::printf("%zu regions (%s), %zu raw -> %zu dets, %.1f ms%s\n", tiles.size(),
-                    detector->last_run_desc().c_str(), n_raw, merged.size(), infer_ms,
+        std::printf("%zu regions (%s), %zu raw -> %zu dets, %.1f ms%s\n", regions.size(),
+                    detector->last_run_desc().c_str(), all.size(), merged.size(), infer_ms,
                     failed ? (" | " + std::to_string(failed) + " region(s) failed").c_str() : "");
         std::fflush(stdout);
 
-        if (failed == static_cast<int>(tiles.size())) ++failed_images; else ++ok_images;
+        if (failed == static_cast<int>(regions.size())) ++failed_images; else ++ok_images;
         total_dets += merged.size();
         total_infer_ms += infer_ms;
     }

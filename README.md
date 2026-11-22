@@ -1,226 +1,160 @@
 # yolov9-sahi
 
-YOLOv9 inference using [ncnn](https://github.com/Tencent/ncnn) or ONNX Runtime with CUDA
-for a full image utilizing the SAHI method (Slicing Aided Hyper Inference): the image is
-cut into overlapping slices at the model's input size, each slice is letterboxed and run
-through YOLOv9, and detections are mapped back and merged across slices as in the SAHI
-library. Small objects in large images stay at native resolution.
+YOLOv9 inference on large images with the **SAHI** method (Slicing Aided Hyper Inference), running on
+[MNN](https://github.com/alibaba/MNN) with a **CUDA** or **Vulkan** backend (one per build), or on the CPU.
 
-This is the `sahi-cuda` branch: SAHI with the CUDA backend. The `cuda-backend` branch
-has the same backend with tiling instead of SAHI; `main` has tiling with ncnn.
+This is the `mnn` branch. Other branches: `main` (tiling, ncnn), `cuda-backend` (tiling, ONNX Runtime CUDA),
+`sahi-cuda` (SAHI, ONNX Runtime CUDA).
 
-## Layout
+You only need the model's **.onnx** file. On first use it is converted to MNN's format (`model.mnn`, next to the
+`.onnx`) by MNN's own converter, which is built together with the program.
 
-```
-yolov9-sahi/
-├── CMakeLists.txt
-├── main.cpp
-├── ncnn/                     # git submodule (Tencent/ncnn, release 20261020)
-└── models/
-    └── LibreYOLO9t_ncnn/     # not committed: model.ncnn.param, model.ncnn.bin, metadata.yaml
-```
+## How it works
 
-## Clone
+1. **Slicing** – the image is cut into overlapping slices of the model's input size (default 640×640, 20 % overlap;
+   the last slice in each row/column is moved back so it ends at the image border). With `--full`, the whole image is
+   added as one more region so large objects are found too.
+2. **Preprocessing** – each region is letterboxed as YOLOv9 expects: bilinear resize (as OpenCV `INTER_LINEAR`),
+   gray (114) padding, centred (or top-left for LibreYOLO-trained checkpoints, from the model's metadata), RGB
+   scaled to 0–1.
+3. **Inference** – regions are run in batches (`--batch`, default 8) on the selected MNN backend.
+4. **Per-region NMS** – class-aware NMS inside each region (`--iou`).
+5. **Merging across slices** – as in the SAHI library: greedy non-maximum *merging* (NMM) with the IOS metric
+   (intersection over the smaller box), so an object cut by a slice edge becomes one box again. `--merge nms` and
+   `--match iou` give plain NMS instead.
 
-```bash
-git clone --recursive https://github.com/detu/yolov9-sahi
-# already cloned without --recursive:
-git submodule update --init --recursive
-```
+Preprocessing, decoding and un-letterboxing are parallelised with OpenMP; the next image is decoded and the previous
+result is drawn and saved in the background.
 
 ## Model
 
-The model comes from [LibreYOLO](https://github.com/LibreYOLO/libreyolo) (MIT license),
-exported to ncnn (any machine with Python; WSL is fine):
+The model comes from [LibreYOLO](https://github.com/LibreYOLO/libreyolo) (MIT license), exported to ONNX with a
+dynamic batch size, so several slices run per call:
 
 ```bash
-pip install "libreyolo[ncnn]"
-libreyolo export --model LibreYOLO9t.pt --format ncnn --imgsz 640   # or your own trained checkpoint
-mv weights/LibreYOLO9t_ncnn models/
+pip install libreyolo
+libreyolo export --model LibreYOLO9t.pt --format onnx --imgsz 640 --dynamic   # or your own trained checkpoint
 ```
 
-This writes `model.ncnn.param`, `model.ncnn.bin` and `metadata.yaml`. Pass the two model
-files; the `metadata.yaml` next to the `.param` file is read automatically for the class
-names, input size, box format and letterbox placement:
+The class names, input size, box format and letterbox placement are read from the ONNX file's metadata (also when
+you pass the converted `.mnn` and the `.onnx` of the same name is next to it). LibreYOLO's YOLOv9 outputs one
+`(4 + classes) × anchors` tensor: `x1, y1, x2, y2` in input pixels, then sigmoid class scores.
+
+Without LibreYOLO metadata, the box format (`x1,y1,x2,y2` or centre/width/height) is detected from the model's
+output, the image is centred, and class names come from `--names`. `--box`, `--pad`, `--in` and `--out` override
+the detection. A model exported with a fixed batch of 1 still works, one slice per run.
+
+## Requirements
+
+- CMake ≥ 3.18, a C++17 compiler, OpenCV (core, imgproc, imgcodecs, dnn), OpenMP
+- **CUDA backend:** the CUDA toolkit (`nvcc`). cuDNN is **not** needed.
+- **Vulkan backend:** nothing at build time (MNN ships its own Vulkan headers); a Vulkan driver at run time.
 
 ```bash
-./build/yolov9_sahi models/LibreYOLO9t_ncnn/model.ncnn.param models/LibreYOLO9t_ncnn/model.ncnn.bin images/
+sudo apt install build-essential cmake libopencv-dev
 ```
-
-LibreYOLO's YOLOv9 (including the NMS-free E2E variant) outputs one `(4 + classes) × anchors`
-tensor: `x1, y1, x2, y2` in input pixels, then sigmoid class scores. LibreYOLO-trained
-checkpoints letterbox the image into the top-left corner; converted official checkpoints
-centre it; `metadata.yaml` records which (`letterbox_pad`).
-
-Without a `metadata.yaml`, the box format (`x1,y1,x2,y2` or centre/width/height) is
-detected from the model's output, the image is centred, and class names come from
-`--names`. This also covers other YOLOv9 ncnn conversions, e.g. the YOLOv9-C model from
-[twlelev/Yolov9-Ncnn](https://github.com/twlelev/Yolov9-Ncnn) (blobs `images` → `output0`,
-picked up automatically). `--box`, `--pad`, `--in` and `--out` override the detection.
 
 ## Build
 
-Requires CMake ≥ 3.18, a C++17 compiler with OpenMP, and OpenCV (core, imgproc,
-imgcodecs, dnn). The build type defaults to Release. Pick the inference backend with
-`SAHI_BACKEND`:
+```bash
+git clone --recursive -b mnn https://github.com/detu/yolov9-sahi.git
+cd yolov9-sahi
+# (already cloned without --recursive, or switched branches?  git submodule update --init)
 
-| `SAHI_BACKEND` | Engine | Model | Runs on |
-|---|---|---|---|
-| `ORT_CUDA` (default on this branch) | ONNX Runtime, CUDA execution provider | `.onnx` | NVIDIA GPU |
-| `ORT_CPU` | ONNX Runtime | `.onnx` | CPU |
-| `NCNN` | ncnn (submodule) | `.param` + `.bin` | CPU (or Vulkan) |
+# CUDA (+ CPU), the default
+cmake -B build
+cmake --build build -j 2
 
-### CUDA backend (ONNX Runtime + nvcc)
+# or Vulkan (+ CPU)
+cmake -B build-vulkan -DYOLOV9_VULKAN=ON
+cmake --build build-vulkan -j 2
 
-ncnn has no CUDA backend, so the GPU path uses ONNX Runtime's CUDA execution provider.
-The image is copied to the GPU once; CUDA kernels compiled with nvcc letterbox the regions
-(bilinear resize and gray padding; slices of the input size are copied 1:1) and write the
-network input directly (BGR→RGB, 0–1, planar), a batch of regions at a time,
-and after inference pick the best class per anchor and keep only the candidates above
-the threshold, so just those few boxes come back to the CPU (instead of ~2.7 MB of raw
-output per region). The network input and output stay in GPU memory (ONNX Runtime
-IoBinding).
+# or CPU only
+cmake -B build-cpu -DYOLOV9_CUDA=OFF
+```
 
-1. **CUDA toolkit** (nvcc) and **cuDNN 9** for your CUDA major version. In WSL2 install
-   only the toolkit (`cuda-toolkit` from NVIDIA's `wsl-ubuntu` repo) and cuDNN, never a
-   Linux GPU driver. With NVIDIA's apt repo: `sudo apt install libcudnn9-cuda-13`
-   (or `-cuda-12`).
-2. **ONNX Runtime GPU package**: download the Linux x64 GPU archive
-   (`onnxruntime-linux-x64-gpu-<version>.tgz`) from
-   [ONNX Runtime releases](https://github.com/microsoft/onnxruntime/releases) and unpack
-   it. ONNX Runtime 1.27 and later is built for CUDA 13; use an older release or its
-   CUDA 12 variant with a CUDA 12 toolkit.
-3. **Model**: export to ONNX with a dynamic batch size, so several slices run per call:
+Only **one** GPU backend can be built: `YOLOV9_CUDA` and `YOLOV9_VULKAN` cannot both be `ON` (CMake stops with an
+error; turning Vulkan on switches the CUDA default off). The CPU backend is always included, so `--backend cpu`
+works in every build. Use a separate build directory per backend. Builds are Release by default.
 
-   ```bash
-   libreyolo export --model LibreYOLO9t.pt --format onnx --imgsz 640 --dynamic
-   ```
+The MNN submodule (pinned at 3.6.2) is configured and built automatically, including `MNNConvert`. The first build
+takes a while; on machines with little RAM keep `-j` low (`-j 2`) — an out-of-memory kill shows up as
+`Error 137` / `Killed`.
 
-   The class names, input size and box format are read from the ONNX file's metadata.
-4. **Build**:
+| CMake option | Default | Meaning |
+|---|---|---|
+| `YOLOV9_CUDA` | `ON` | Build MNN's CUDA backend |
+| `YOLOV9_VULKAN` | `OFF` | Build MNN's Vulkan backend |
+| `YOLOV9_CUDA_ARCH` | *(nvidia-smi)* | GPU compute capability to compile for, e.g. `8.9` (RTX 40xx / RTX Ada laptop GPUs), `8.6` (RTX 30xx), `12.0` (RTX 50xx) |
+| `YOLOV9_CUDA_NATIVE_ARCH` | `ON` | Compile the CUDA kernels only for that one GPU (much faster build) |
+| `YOLOV9_NVCC` | *(search)* | Path to `nvcc` |
 
-   ```bash
-   cmake -B build -DONNXRUNTIME_ROOT=$HOME/onnxruntime-linux-x64-gpu-<version>
-   cmake --build build -j 2
-   ```
+`nvcc` is searched on `PATH`, in `$CUDA_HOME`, `$CUDA_PATH`, `/usr/local/cuda` and `/usr/local/cuda-*` (newest
+first), so it does not need to be on `PATH` (common on WSL2).
 
-   nvcc compiles the kernels for the GPU in the machine (CMake ≥ 3.24); otherwise pass
-   e.g. `-DCMAKE_CUDA_ARCHITECTURES=89`. nvcc is found on PATH, in `$CUDA_HOME/bin`, or in
-   `/usr/local/cuda*/bin` (newest version first); otherwise pass
-   `-DCMAKE_CUDA_COMPILER=/path/to/nvcc`. The program finds
-   `libonnxruntime*.so` in the package directory by itself (RPATH).
+## Usage
 
 ```bash
-./build/yolov9_sahi models/LibreYOLO9t.onnx images/ -o results/ --csv detections.csv
-```
-
-The startup line shows the GPU (`CUDA (NVIDIA ...)`) and the batch size. `-b/--batch`
-sets the slices per run (default 8); `--device` picks the GPU. The first run of a new
-batch size is slower while cuDNN picks its algorithms.
-
-### ncnn backend (CPU)
-
-```bash
-cmake -B build -DSAHI_BACKEND=NCNN
-cmake --build build -j 4
-```
-
-Options:
-
-```bash
-cmake -B build -DSAHI_BACKEND=NCNN -DSAHI_VULKAN=ON        # ncnn with Vulkan GPU support (run with --gpu)
-cmake -B build -DSAHI_BACKEND=NCNN -DSAHI_SYSTEM_NCNN=ON -Dncnn_DIR=<prefix>/lib/cmake/ncnn   # installed ncnn
-```
-
-ncnn runs fast on CPU. **WSL2:** Vulkan in WSL2 goes through Mesa's Dozen driver (Vulkan
-on Direct3D 12), which is very slow, so use the CUDA backend for the GPU there.
-
-## Run
-
-Arguments are, in order, the model, then one or more images and/or directories:
-
-```
-yolov9_sahi <model.onnx> <image|dir> [<image|dir> ...] [options]                  # ORT_CUDA / ORT_CPU build
-yolov9_sahi <model.param> <model.bin> <image|dir> [<image|dir> ...] [options]     # NCNN build
+./build/yolov9_sahi <model.onnx|model.mnn> <image|dir> [<image|dir> ...] [options]
 ```
 
 ```bash
-# one image
-./build/yolov9_sahi models/yolov9.param models/yolov9.bin image.jpg -o result.jpg
+# One image -> output.jpg
+./build/yolov9_sahi models/LibreYOLO9t.onnx big_image.jpg
 
-# a whole folder (add -r for subfolders), with a CSV of all detections
-./build/yolov9_sahi models/yolov9.param models/yolov9.bin images/ -o results/ --csv detections.csv
+# A folder (recursively) -> out/<name>_det.jpg, plus all detections as CSV
+./build/yolov9_sahi models/LibreYOLO9t.onnx images/ -r -o out --csv detections.csv
+
+# Vulkan build, whole image as an extra region, own class names
+./build-vulkan/yolov9_sahi models/LibreYOLO9t.onnx images/ --full -n classes.txt
 ```
+
+The model is loaded once and every image is processed with it. Output boxes are drawn with a label (class name and
+score) on a green background.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-o, --output` | `output.jpg` / `output/` | output file for one image, output directory for several (`<name>_det.<ext>`) |
-| `--csv` | off | write all detections: `image,class_id,class_name,score,x1,y1,x2,y2` |
-| `-n, --names` | `metadata.yaml` | text file of class names, one per line: line 1 = class 0, line 2 = class 1, ... |
-| `-r, --recursive` | off | scan directories recursively |
-| `-s, --size` | model metadata, else 640 | model input size |
-| `--slice` | input size | slice size (slices are letterboxed to the input size) |
-| `--overlap` | 0.20 | slice overlap ratio |
-| `--full` | off | also detect on the whole image (catches objects larger than a slice) |
-| `-b, --batch` | 8 | ONNX Runtime: slices per inference run (models exported with a dynamic batch) |
-| `--device` | 0 | ORT_CUDA: GPU index |
-| `-w, --workers` | physical cores | ncnn: slices run in parallel (OpenMP) |
-| `-t, --threads` | cores / workers | ncnn: threads per slice |
-| `-j, --cores` | physical cores | ncnn / ORT_CPU: total thread budget |
-| `--gpu` | off | ncnn: Vulkan (needs `-DSAHI_VULKAN=ON`) |
-| `--conf` | 0.25 | confidence threshold |
-| `--iou` | 0.45 | NMS IoU threshold within a slice |
-| `--merge` | `nmm` | merging across slices: `nmm` merges overlapping boxes into one, `nms` keeps the best |
-| `--match` | `ios` | overlap metric for the merge: `ios` (intersection over smaller box) or `iou` |
-| `--match-thresh` | 0.5 | overlap above which boxes are merged |
-| `--box` | model metadata, else detected | box format in the output: `xyxy` or `cxcywh` |
-| `--pad` | model metadata, else `center` | letterbox placement: `center` or `topleft` |
-| `--in`, `--out` | model's first input/output | input/output names |
+| `-o, --output` | `output.jpg` / `output/` | Output file (one image) or directory (several images) |
+| `--csv <file>` | | Write all detections (`image,class_id,class_name,score,x1,y1,x2,y2`) |
+| `-n, --names <file>` | model metadata | Class names, one per line: line 1 = class 0, line 2 = class 1, … |
+| `-r, --recursive` | | Scan directories recursively |
+| `-d, --backend` | `auto` | `cuda` or `vulkan` (whichever was built), or `cpu`; `auto` = the GPU backend if it works here, else CPU |
+| `--precision` | `normal` | `normal`, `high`, or `low` (fp16 where the backend supports it) |
+| `-b, --batch` | `8` | Regions per inference run (models exported with a fixed batch fall back to 1) |
+| `-t, --threads` | all cores | CPU backend threads and pre/post-processing threads |
+| `--fp16` | | Convert the `.onnx` with fp16 weights (`model.fp16.mnn`) |
+| `--reconvert` | | Convert again even if the `.mnn` is up to date |
+| `-s, --size` | model | Model input size |
+| `--slice` | input size | Slice size |
+| `--overlap` | `0.2` | Slice overlap ratio |
+| `--full` | | Also detect on the whole image |
+| `--conf` | `0.25` | Confidence threshold |
+| `--iou` | `0.45` | NMS IoU threshold inside a region |
+| `--merge` | `nmm` | Cross-slice merging: `nmm` (merge boxes) or `nms` (keep the best) |
+| `--match` | `ios` | Overlap metric for merging: `ios` or `iou` |
+| `--match-thresh` | `0.5` | Overlap above which boxes are merged |
+| `--preprocess` | metadata / `yolo` | `yolo` (RGB, 0–1, OpenCV-style bilinear resize) or `rtmdet` (BGR, mmdet mean/std) |
+| `--pad` | metadata / `center` | Letterbox placement: `center` or `topleft` (LibreYOLO-trained checkpoints) |
+| `--box` | metadata / detected | Box format of the output: `xyxy` or `cxcywh` |
+| `--in`, `--out` | | Input / output tensor names |
 
-### How SAHI works here
+## Troubleshooting
 
-1. **Slices.** The image is cut into `slice × slice` slices (default: the model input
-   size) overlapping by `--overlap` (default 20%); the last slice in each row/column is
-   shifted back to end at the image border, so slices keep their full size. With
-   `--full`, the whole image is added as one more region.
-2. **Per region.** Each region is letterboxed to the input size (aspect ratio kept, gray
-   padding centred, or top-left for LibreYOLO-trained checkpoints, from the model's
-   metadata), normalized to 0–1 RGB and run through YOLOv9; boxes are decoded (best class
-   per anchor), mapped back to the image and de-duplicated within the region with
-   class-aware NMS.
-3. **Merge.** An object cut by a slice edge appears as a full box from one slice plus a
-   fragment from its neighbour, or as two halves. As in the SAHI library, the default
-   merge is greedy NMM with the IOS metric: boxes of the same class whose intersection
-   covers more than half of the smaller box are merged into their union, keeping the
-   best score. Use `--merge nms --match iou` for plain NMS.
+- **`nvcc not found`** – install the CUDA toolkit or pass `-DYOLOV9_NVCC=/usr/local/cuda/bin/nvcc`; or build the
+  Vulkan backend instead: `-DYOLOV9_CUDA=OFF -DYOLOV9_VULKAN=ON`.
+- **`Error generating file ... MNN_Cuda_Main_generated_*.cu.o`** – nvcc failed on one of MNN's CUDA files; the real
+  message is a few lines above it (rebuild with `cmake --build build -j 1 2>&1 | tee build.log` to see it clearly).
+  - `Unsupported gpu architecture 'compute_60'` (CUDA 13): the GPU architecture was not known while configuring.
+    It is now read from `nvidia-smi`; otherwise pass it, e.g. `-DYOLOV9_CUDA_ARCH=8.9`, in a **new** build directory.
+  - `cutlass/matrix.h: ... has no member named 'set_slice3x3'` (GCC 14 and newer): a typo in MNN's bundled CUTLASS
+    that newer GCC rejects. Handled automatically (`-Wno-template-body` is passed to the host compiler).
+  - `Killed` / `Error 137` / `cicc died`: out of memory; MNN's CUTLASS kernels are heavy to compile. Use `-j 1`.
+- **`Warning: cuda backend not available here; MNN uses CPU`** – the CUDA driver/GPU is not visible (check
+  `nvidia-smi`). Under WSL2, `/usr/lib/wsl/lib` must be on the library path.
+- **Vulkan under WSL2** uses the Dozen (D3D12) driver, which works but is slower than CUDA.
+- **Slower after a while on a laptop** – usually thermal/power throttling of the GPU; check with
+  `nvidia-smi --query-gpu=temperature.gpu,clocks.sm,power.draw,clocks_throttle_reasons.active --format=csv -l 1`.
 
-Output is deterministic regardless of the number of threads or the batch size. SAHI works
-best when objects are smaller than a slice; add `--full` when the images also contain
-objects much larger than a slice.
+## License
 
-### Threading
-
-With ncnn, the program runs **one slice per physical core, with ncnn single-threaded**.
-SAHI produces many equal slices, and running them side by side scales almost linearly,
-while ncnn's own per-layer threading scales worse on a single 640×640 slice and nesting the
-two levels costs extra. Measured on 2 cores with YOLOv9-C, 35 regions:
-
-| Setup | Inference | vs 1 core |
-|---|---|---|
-| 1 core | 32.0 s | 1.0× |
-| 1 slice × 2 ncnn threads | 21.8 s | 1.47× |
-| 2 slices × 1 thread (default) | 16.1 s | 1.99× |
-
-Details:
-
-- The split is fixed at startup: ncnn's convolution layers fix their thread count when
-  the model is loaded. `-w` (slices in parallel) and `-t` (ncnn threads per slice) override
-  it; `-j` sets the total budget (default: physical cores; hyperthreads add little here).
-- Images that fit in a single slice can't use slice parallelism. For those, a second copy
-  of the model with all cores is loaded the first time such an image appears.
-- All slices share one copy of the model weights; each worker has its own ncnn memory pools
-  (by default ncnn's extractors share one locked pool, which serializes concurrent slices).
-- With several slices in flight, ncnn threads don't spin-wait between layers, so idle
-  threads don't take cores from other slices.
-- The next image is decoded and the previous result is drawn and saved in the background
-  while the current image runs.
+MNN (the `MNN/` submodule) is licensed under Apache-2.0. YOLOv9 models from LibreYOLO are MIT-licensed.

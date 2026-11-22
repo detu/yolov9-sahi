@@ -1,3 +1,9 @@
 build/
 models/*
 !models/.gitkeep
+build-*/
+*.mnn
+*.convert.log
+output/
+output.jpg
+*.csv
